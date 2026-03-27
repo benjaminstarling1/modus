@@ -1,0 +1,32 @@
+[package]
+name = "rust-desktop-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rust-desktop-app"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", features = ["wgpu"] }
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["all_loaders"] }
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+pollster = "0.4"
+rfd = "0.15"
+csv = "1"
+polars = { version = "0.46", features = ["parquet", "csv", "lazy", "dtype-datetime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+anyhow = "1"
+rustfft = "6"
+num-complex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+egui-phosphor = { version = "0.9.0", features = ["regular"] }
+egui_plot = "0.31"
+
+[profile.release]
+opt-level = 3
