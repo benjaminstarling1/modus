@@ -114,6 +114,12 @@ pub struct UserPrefs {
     /// Default colour for vector arrows when contour colouring is off.
     #[serde(default = "default_arrow_color")]
     pub arrow_color: [f32; 3],
+    /// Default colour for nodes (when no per-node override or contour is active).
+    #[serde(default = "default_node_color")]
+    pub default_node_color: [f32; 3],
+    /// Default colour for edges (when no per-edge override or contour is active).
+    #[serde(default = "default_edge_color")]
+    pub default_edge_color: [f32; 3],
 }
 
 impl Default for UserPrefs {
@@ -136,6 +142,8 @@ impl Default for UserPrefs {
             light_brightness: 1.5,
             lighting_enabled: true,
             arrow_color: [0.0, 0.0, 0.0],
+            default_node_color: [1.0, 0.85, 0.1],
+            default_edge_color: [0.3, 0.85, 1.0],
         }
     }
 }
@@ -145,6 +153,8 @@ fn default_true() -> bool { true }
 fn default_viewport_bg_dark() -> [f32; 3] { [0.1, 0.1, 0.12] }
 fn default_light_brightness() -> f32 { 1.5 }
 fn default_arrow_color() -> [f32; 3] { [0.0, 0.0, 0.0] }
+fn default_node_color() -> [f32; 3] { [1.0, 0.85, 0.1] }
+fn default_edge_color() -> [f32; 3] { [0.3, 0.85, 1.0] }
 
 impl UserPrefs {
     fn config_path() -> Option<std::path::PathBuf> {
@@ -492,6 +502,16 @@ pub fn show_options_window(ctx: &egui::Context, open: &mut bool, prefs: &mut Use
                     // Arrow colour
                     ui.label("Arrow Color:");
                     ui.color_edit_button_rgb(&mut prefs.arrow_color);
+                    ui.end_row();
+
+                    // Default node colour
+                    ui.label("Default Node Color:");
+                    ui.color_edit_button_rgb(&mut prefs.default_node_color);
+                    ui.end_row();
+
+                    // Default edge colour
+                    ui.label("Default Edge Color:");
+                    ui.color_edit_button_rgb(&mut prefs.default_edge_color);
                     ui.end_row();
                 });
 
