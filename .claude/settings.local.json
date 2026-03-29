@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(python -c \":*)",
+      "Skill(update-config)",
+      "Bash(cargo doc:*)",
+      "Read(//c/Users/benja/.cargo/registry/src/**)"
+    ]
+  }
+}

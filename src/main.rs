@@ -14,7 +14,7 @@ use app::App;
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Operational Deflection Shape")
+            .with_title("modus")
             .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 600.0]),
         depth_buffer: 24,
@@ -32,7 +32,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Operational Deflection Shape",
+        "modus",
         native_options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )

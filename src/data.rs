@@ -30,13 +30,13 @@ impl DataType {
 pub enum Unit {
     // --- Displacement ---
     Millimeter,
-    Centimeter,
     Meter,
+    Kilometer,
     Inch,
     Foot,
+    Mile,
     // --- Velocity ---
     MillimeterPerSec,
-    CentimeterPerSec,
     MeterPerSec,
     KilometerPerHour,
     MilePerHour,
@@ -44,7 +44,6 @@ pub enum Unit {
     FootPerSec,
     // --- Acceleration ---
     MillimeterPerSec2,
-    CentimeterPerSec2,
     MeterPerSec2,
     StandardGravity,
     InchPerSec2,
@@ -56,19 +55,18 @@ impl Unit {
     pub fn label(&self) -> &'static str {
         match self {
             Unit::Millimeter         => "mm",
-            Unit::Centimeter         => "cm",
             Unit::Meter              => "m",
+            Unit::Kilometer          => "km",
             Unit::Inch               => "in",
             Unit::Foot               => "ft",
+            Unit::Mile               => "mi",
             Unit::MillimeterPerSec   => "mm/s",
-            Unit::CentimeterPerSec   => "cm/s",
             Unit::MeterPerSec        => "m/s",
             Unit::KilometerPerHour   => "km/h",
             Unit::MilePerHour        => "mph",
             Unit::InchPerSec         => "in/s",
             Unit::FootPerSec         => "ft/s",
             Unit::MillimeterPerSec2  => "mm/s²",
-            Unit::CentimeterPerSec2  => "cm/s²",
             Unit::MeterPerSec2       => "m/s²",
             Unit::StandardGravity    => "g",
             Unit::InchPerSec2        => "in/s²",
@@ -82,19 +80,18 @@ impl Unit {
     pub fn to_si_factor(&self) -> f32 {
         match self {
             Unit::Millimeter         => 0.001,
-            Unit::Centimeter         => 0.01,
             Unit::Meter              => 1.0,
+            Unit::Kilometer          => 1000.0,
             Unit::Inch               => 0.0254,
             Unit::Foot               => 0.3048,
+            Unit::Mile               => 1609.344,
             Unit::MillimeterPerSec   => 0.001,
-            Unit::CentimeterPerSec   => 0.01,
             Unit::MeterPerSec        => 1.0,
             Unit::KilometerPerHour   => 1.0 / 3.6,
             Unit::MilePerHour        => 0.44704,
             Unit::InchPerSec         => 0.0254,
             Unit::FootPerSec         => 0.3048,
             Unit::MillimeterPerSec2  => 0.001,
-            Unit::CentimeterPerSec2  => 0.01,
             Unit::MeterPerSec2       => 1.0,
             Unit::StandardGravity    => 9.80665,
             Unit::InchPerSec2        => 0.0254,
@@ -115,16 +112,16 @@ impl Unit {
     pub fn options_for(dt: &DataType) -> &'static [Unit] {
         match dt {
             DataType::Displacement => &[
-                Unit::Millimeter, Unit::Centimeter, Unit::Meter,
-                Unit::Inch, Unit::Foot,
+                Unit::Millimeter, Unit::Meter, Unit::Kilometer,
+                Unit::Inch, Unit::Foot, Unit::Mile,
             ],
             DataType::Velocity => &[
-                Unit::MillimeterPerSec, Unit::CentimeterPerSec, Unit::MeterPerSec,
+                Unit::MillimeterPerSec, Unit::MeterPerSec,
                 Unit::KilometerPerHour, Unit::MilePerHour,
                 Unit::InchPerSec, Unit::FootPerSec,
             ],
             DataType::Acceleration => &[
-                Unit::MillimeterPerSec2, Unit::CentimeterPerSec2, Unit::MeterPerSec2,
+                Unit::MillimeterPerSec2, Unit::MeterPerSec2,
                 Unit::StandardGravity, Unit::InchPerSec2, Unit::FootPerSec2,
             ],
         }
@@ -220,6 +217,56 @@ impl Dataset {
         let t1 = ti[idx + 1];
         let frac = if (t1 - t0).abs() < 1e-12 { 0.0 } else { (t - t0) / (t1 - t0) };
         disp[idx] * (1.0 - frac) + disp[idx + 1] * frac
+    }
+
+    /// Compute the time-derivative of the pre-integrated displacement channel at time `t`
+    /// using finite differences.  Returns velocity in SI units (m/s).
+    pub fn sample_velocity_at(&self, channel: &str, t: f64) -> f32 {
+        let disp = match self.displacement.get(channel) {
+            Some(d) if d.len() >= 2 => d,
+            _ => return 0.0,
+        };
+        let ti = &self.time;
+        let n = ti.len().min(disp.len());
+        if n < 2 { return 0.0; }
+        let t = t as f32;
+        // Find the nearest index, clamp to valid range.
+        let i = ti.partition_point(|&v| v <= t).min(n - 1);
+        // Central differences where possible, one-sided at edges.
+        if i == 0 {
+            let dt = ti[1] - ti[0];
+            if dt.abs() < 1e-12 { return 0.0; }
+            (disp[1] - disp[0]) / dt
+        } else if i >= n - 1 {
+            let dt = ti[n - 1] - ti[n - 2];
+            if dt.abs() < 1e-12 { return 0.0; }
+            (disp[n - 1] - disp[n - 2]) / dt
+        } else {
+            let dt = ti[i + 1] - ti[i - 1];
+            if dt.abs() < 1e-12 { return 0.0; }
+            (disp[i + 1] - disp[i - 1]) / dt
+        }
+    }
+
+    /// Compute the second time-derivative of the pre-integrated displacement channel at time `t`.
+    /// Returns acceleration in SI units (m/s²).
+    pub fn sample_acceleration_at(&self, channel: &str, t: f64) -> f32 {
+        let disp = match self.displacement.get(channel) {
+            Some(d) if d.len() >= 3 => d,
+            _ => return 0.0,
+        };
+        let ti = &self.time;
+        let n = ti.len().min(disp.len());
+        if n < 3 { return 0.0; }
+        let t = t as f32;
+        let i = ti.partition_point(|&v| v <= t).min(n - 1);
+        // Second finite difference, clamped to interior.
+        let i = i.max(1).min(n - 2);
+        let dt_back = ti[i] - ti[i - 1];
+        let dt_fwd  = ti[i + 1] - ti[i];
+        let dt = 0.5 * (dt_back + dt_fwd);
+        if dt.abs() < 1e-12 { return 0.0; }
+        (disp[i + 1] - 2.0 * disp[i] + disp[i - 1]) / (dt * dt)
     }
 
     /// Duration of the dataset in seconds (0.0 if no time data).
@@ -499,6 +546,18 @@ pub fn sample_qualified(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
     let Some((file, ch)) = qualified.split_once("::") else { return 0.0 };
     let Some(ds) = datasets.iter().find(|d| d.name == file) else { return 0.0 };
     ds.sample_displacement(ch, t)
+}
+
+pub fn sample_velocity_qualified(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
+    let Some((file, ch)) = qualified.split_once("::") else { return 0.0 };
+    let Some(ds) = datasets.iter().find(|d| d.name == file) else { return 0.0 };
+    ds.sample_velocity_at(ch, t)
+}
+
+pub fn sample_acceleration_qualified(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
+    let Some((file, ch)) = qualified.split_once("::") else { return 0.0 };
+    let Some(ds) = datasets.iter().find(|d| d.name == file) else { return 0.0 };
+    ds.sample_acceleration_at(ch, t)
 }
 
 /// Longest duration in seconds, considering only datasets that have channels

@@ -2441,6 +2441,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "modus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "csv",
+ "dirs",
+ "eframe",
+ "egui",
+ "egui-phosphor",
+ "egui_extras",
+ "egui_plot",
+ "glam",
+ "image",
+ "num-complex",
+ "pathdiff",
+ "polars",
+ "pollster",
+ "rfd",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "wgpu",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.7.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2972,6 +2998,12 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "percent-encoding"
@@ -4048,31 +4080,6 @@ name = "roxmltree"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3cd14fd5e3b777a7422cca79358c57a8f6e3a703d9ac187448d0daf220c2407f"
-
-[[package]]
-name = "rust-desktop-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "csv",
- "dirs",
- "eframe",
- "egui",
- "egui-phosphor",
- "egui_extras",
- "egui_plot",
- "glam",
- "image",
- "num-complex",
- "polars",
- "pollster",
- "rfd",
- "rustfft",
- "serde",
- "serde_json",
- "wgpu",
-]
 
 [[package]]
 name = "rustc-hash"

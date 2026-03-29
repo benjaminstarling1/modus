@@ -1,4 +1,5 @@
 use crate::csys_builder::CsysManager;
+use crate::persist::DistanceUnit;
 use crate::table::{Row, identity_mat3, row_position};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -26,6 +27,7 @@ pub struct CreateNodesState {
     pub mode: CreateNodesMode,
     // Copy-with-offset
     pub offset: [f32; 3],
+    pub offset_unit: DistanceUnit,
     pub csys_index: usize,
     // Interpolate
     pub node_a: String,
@@ -38,6 +40,7 @@ impl Default for CreateNodesState {
         Self {
             mode: CreateNodesMode::None,
             offset: [0.0; 3],
+            offset_unit: DistanceUnit::default(),
             csys_index: 0,
             node_a: String::new(),
             node_b: String::new(),
@@ -54,11 +57,12 @@ impl Default for CreateNodesState {
 ///
 /// Returns `Some(vec_of_new_rows)` when the user clicks Create, else `None`.
 pub fn show_create_nodes_window(
-    ctx:     &egui::Context,
-    open:    &mut bool,
-    state:   &mut CreateNodesState,
-    rows:    &[Row],
-    manager: &CsysManager,
+    ctx:        &egui::Context,
+    open:       &mut bool,
+    state:      &mut CreateNodesState,
+    rows:       &[Row],
+    manager:    &CsysManager,
+    model_unit: &DistanceUnit,
 ) -> Option<Vec<Row>> {
     if !*open { return None; }
 
@@ -105,7 +109,7 @@ pub fn show_create_nodes_window(
                 }
 
                 CreateNodesMode::CopyWithOffset => {
-                    result = copy_with_offset_ui(ui, state, rows, manager);
+                    result = copy_with_offset_ui(ui, state, rows, manager, model_unit);
                 }
 
                 CreateNodesMode::Interpolate => {
@@ -122,10 +126,11 @@ pub fn show_create_nodes_window(
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn copy_with_offset_ui(
-    ui:      &mut egui::Ui,
-    state:   &mut CreateNodesState,
-    rows:    &[Row],
-    manager: &CsysManager,
+    ui:         &mut egui::Ui,
+    state:      &mut CreateNodesState,
+    rows:       &[Row],
+    manager:    &CsysManager,
+    model_unit: &DistanceUnit,
 ) -> Option<Vec<Row>> {
     let selected: Vec<&Row> = rows.iter().filter(|r| r.selected).collect();
     let sel_count = selected.len();
@@ -149,7 +154,7 @@ fn copy_with_offset_ui(
 
     ui.add_space(4.0);
 
-    // Offset inputs
+    // Offset inputs with unit selector
     ui.horizontal(|ui| {
         ui.label("Offset:");
         ui.add_space(4.0);
@@ -159,7 +164,27 @@ fn copy_with_offset_ui(
         ui.add(egui::DragValue::new(&mut state.offset[1]).speed(0.1));
         ui.label("dZ:");
         ui.add(egui::DragValue::new(&mut state.offset[2]).speed(0.1));
+        ui.add_space(6.0);
+        egui::ComboBox::from_id_salt("create_nodes_offset_unit")
+            .selected_text(state.offset_unit.label())
+            .width(52.0)
+            .show_ui(ui, |ui| {
+                for u in DistanceUnit::ALL {
+                    ui.selectable_value(&mut state.offset_unit, u.clone(), u.label());
+                }
+            });
     });
+    if state.offset_unit != *model_unit {
+        ui.label(
+            egui::RichText::new(format!(
+                "Offset entered in {} — will be converted to {} on create.",
+                state.offset_unit.label(), model_unit.label()
+            ))
+            .italics()
+            .color(egui::Color32::from_rgb(140, 180, 220))
+            .size(11.0),
+        );
+    }
 
     ui.add_space(8.0);
 
@@ -186,12 +211,20 @@ fn copy_with_offset_ui(
             || state.offset[2].abs() > 1e-9);
 
     if ui.add_enabled(can_create, egui::Button::new(format!("{}  Create", egui_phosphor::regular::CHECK))).clicked() {
+        // Convert offset from the user's chosen unit to the model unit.
+        let unit_factor = state.offset_unit.convert_factor(model_unit) as f32;
+        let converted_offset = [
+            state.offset[0] * unit_factor,
+            state.offset[1] * unit_factor,
+            state.offset[2] * unit_factor,
+        ];
+
         // Transform offset from selected CSYS to global
         let csys_mat = manager.entries
             .get(state.csys_index)
             .map(|e| e.matrix)
             .unwrap_or_else(identity_mat3);
-        let global_offset = mat3_transform(csys_mat, state.offset);
+        let global_offset = mat3_transform(csys_mat, converted_offset);
 
         let mut new_rows: Vec<Row> = Vec::new();
         for src in &selected {

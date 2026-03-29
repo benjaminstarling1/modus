@@ -1,5 +1,5 @@
 use eframe::egui_wgpu;
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use crate::table::GlyphShape;
 use crate::persist::DistanceUnit;
@@ -26,6 +26,13 @@ pub struct Viewport3D {
     pub show_yz:         bool,
     pub show_zx:         bool,
     pub orthographic:    bool,
+    // Label overlay toggles
+    pub show_node_numbers:  bool,
+    pub show_edge_numbers:  bool,
+    pub show_glyph_numbers: bool,
+    pub show_mesh_numbers:  bool,
+    /// When true, the next LMB click in the viewport sets the orbit center to the nearest node.
+    pub pick_orbit_center: bool,
 }
 
 impl Default for Viewport3D {
@@ -41,6 +48,11 @@ impl Default for Viewport3D {
             show_yz:         false,
             show_zx:         false,
             orthographic:    true,
+            show_node_numbers:  false,
+            show_edge_numbers:  false,
+            show_glyph_numbers: false,
+            show_mesh_numbers:  false,
+            pick_orbit_center:  false,
         }
     }
 }
@@ -57,17 +69,18 @@ impl Viewport3D {
     pub fn view_matrix(&self) -> Mat4 {
         Mat4::look_at_rh(self.eye(), self.target, Vec3::Y)
     }
-    pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
-        // Scale near/far with camera distance for consistent depth precision.
-        let near = self.distance * 0.001;
-        let far  = self.distance * 200.0;
+    pub fn proj_matrix(&self, aspect: f32, scene_radius: f32) -> Mat4 {
+        // Near plane is based on scene size so it doesn't shrink to zero as
+        // the camera zooms in, which would cause depth-buffer precision loss.
+        // Far plane extends well beyond both the scene and the camera distance.
+        let near = (scene_radius * 0.0002).max(1e-4);
+        let far  = (scene_radius * 10.0 + self.distance * 2.0).max(near * 2000.0);
         if self.orthographic {
-            // Half-height matches what you'd see in perspective at this distance.
             let half_h = self.distance * (45_f32.to_radians() / 2.0).tan();
             let half_w = half_h * aspect;
             Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -far, far)
         } else {
-            Mat4::perspective_rh(45_f32.to_radians(), aspect, near.max(1e-6), far)
+            Mat4::perspective_rh(45_f32.to_radians(), aspect, near, far)
         }
     }
     pub fn init_renderer(wrs: &egui_wgpu::RenderState) {
@@ -102,6 +115,27 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// Lit vertex: position + color + surface normal.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LitVtx {
+    pos:    [f32; 3],
+    color:  [f32; 4],
+    normal: [f32; 3],
+}
+
+fn lit_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<LitVtx>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute { offset: 0,  shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+            wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+            wgpu::VertexAttribute { offset: 28, shader_location: 2, format: wgpu::VertexFormat::Float32x3 },
+        ],
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Uniform
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,8 +143,13 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
-    mvp:   [[f32; 4]; 4],
-    color: [f32; 4],   // multiplied in shader on top of vertex color
+    mvp:        [[f32; 4]; 4],
+    color:      [f32; 4],       // multiplied in shader on top of vertex color
+    light_dir:  [f32; 4],       // eye-space light direction (xyz), w=0 padding
+    // normal_mat: 3×3 stored as 3 columns of vec4 for std140 alignment
+    normal_mat_col0: [f32; 4],
+    normal_mat_col1: [f32; 4],
+    normal_mat_col2: [f32; 4],
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,9 +157,10 @@ struct Uniforms {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct Renderer {
-    line_pipeline:  wgpu::RenderPipeline,
-    tri_pipeline:   wgpu::RenderPipeline,
-    bgl:            wgpu::BindGroupLayout,
+    line_pipeline:      wgpu::RenderPipeline,
+    tri_pipeline:       wgpu::RenderPipeline,
+    lit_tri_pipeline:   wgpu::RenderPipeline,
+    bgl:                wgpu::BindGroupLayout,
 
     axes_vbuf:      wgpu::Buffer,
     axes_count:     u32,
@@ -224,6 +264,44 @@ impl Renderer {
             cache: None,
         });
 
+        let lit_vs = wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_lit"),
+            buffers: &[lit_vertex_layout()],
+            compilation_options: Default::default(),
+        };
+
+        let lit_tri_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("lit_tri_pip"),
+            layout: Some(&layout),
+            vertex: lit_vs,
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_lit"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: fmt,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+
         // Geometry
         let (av, ac) = make_axes(1.0);
         let axes_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -243,7 +321,7 @@ impl Renderer {
         });
 
         Self {
-            line_pipeline, tri_pipeline, bgl,
+            line_pipeline, tri_pipeline, lit_tri_pipeline, bgl,
             axes_vbuf, axes_count: ac,
             sphere_vbuf, sphere_ibuf, sphere_icount,
         }
@@ -270,6 +348,7 @@ impl Renderer {
 // Per-frame draw list built in prepare(), consumed in paint()
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 enum DrawCmd {
     Lines    { bg: wgpu::BindGroup, count: u32 },
     Sphere   { bg: wgpu::BindGroup },
@@ -277,6 +356,8 @@ enum DrawCmd {
     DynLines { bg: wgpu::BindGroup, vbuf: wgpu::Buffer, count: u32 },
     /// Dynamic triangle list — stores vertex+index buffers built each frame.
     DynTris  { bg: wgpu::BindGroup, vbuf: wgpu::Buffer, ibuf: wgpu::Buffer, icount: u32 },
+    /// Lit dynamic triangle list — uses the lit pipeline with normals.
+    LitTris  { bg: wgpu::BindGroup, vbuf: wgpu::Buffer, ibuf: wgpu::Buffer, icount: u32 },
 }
 
 struct FrameList(Vec<DrawCmd>);
@@ -287,6 +368,7 @@ struct FrameList(Vec<DrawCmd>);
 
 pub struct VpCallback {
     vp:            Mat4,   // proj * view
+    view:          Mat4,   // view matrix (for computing normal matrix per model)
     show_csys:     bool,
     show_xy:       bool,
     show_yz:       bool,
@@ -312,8 +394,10 @@ pub struct VpCallback {
     selected_nodes: Vec<bool>,
     /// Arm length of local CSYS as a fraction of view_scale * 0.25 (same formula as global CSYS).
     local_csys_scale: f32,
-    /// Radius of edge cylinders.
+    /// Global radius of edge cylinders (fallback).
     edge_thickness: f32,
+    /// Per-edge radii (overrides edge_thickness when present).
+    edge_thicknesses: Vec<f32>,
     /// Glyph data: (world_pos, shape, color_rgba, size, stretch, tube_ratio)
     glyphs: Vec<([f32; 3], GlyphShape, [f32; 4], f32, [f32; 3], f32)>,
     /// Per-glyph selection flags for highlight rings.
@@ -322,6 +406,10 @@ pub struct VpCallback {
     mesh_surfaces: Vec<MeshRenderData>,
     /// Wireframe edges: undeformed (base) geometry, drawn as dull gray lines.
     wireframe_edges: Vec<([f32; 3], [f32; 3])>,
+    /// Lighting brightness multiplier.
+    light_brightness: f32,
+    /// Vector arrows: (world_pos, normalised_dir, color_rgba, world_length).
+    arrows: Vec<([f32; 3], [f32; 3], [f32; 4], f32)>,
 }
 
 impl egui_wgpu::CallbackTrait for VpCallback {
@@ -336,6 +424,47 @@ impl egui_wgpu::CallbackTrait for VpCallback {
         let renderer: &Renderer = resources.get().unwrap();
         let mut cmds: Vec<DrawCmd> = Vec::new();
 
+        // Eye-space light direction — fixed upper-left-front.
+        let light_eye = Vec3::new(0.3, 0.8, 0.5).normalize();
+        let light_dir_arr: [f32; 4] = [light_eye.x, light_eye.y, light_eye.z, self.light_brightness];
+
+        // Helper: build unlit Uniforms (for lines / overlay geometry).
+        let unlit = |mvp: Mat4, color: [f32; 4]| -> Uniforms {
+            Uniforms {
+                mvp: mvp.to_cols_array_2d(),
+                color,
+                light_dir: [0.0; 4],
+                normal_mat_col0: [1.0, 0.0, 0.0, 0.0],
+                normal_mat_col1: [0.0, 1.0, 0.0, 0.0],
+                normal_mat_col2: [0.0, 0.0, 1.0, 0.0],
+            }
+        };
+
+        // Helper: build lit Uniforms (for triangle geometry with normals).
+        let view = self.view;
+        let lit = |mvp: Mat4, model: Mat4, color: [f32; 4]| -> Uniforms {
+            // Normal matrix = transpose(inverse(view * model)).  For uniform
+            // scaling the inverse-transpose equals the original normalised.
+            // We compute the full 3×3 inverse-transpose for correctness with
+            // non-uniform scales (glyph stretch).  We store it as 3 columns
+            // of vec4 for std140 alignment.
+            let mv = view * model;
+            let mv3 = glam::Mat3::from_cols(
+                mv.x_axis.truncate(),
+                mv.y_axis.truncate(),
+                mv.z_axis.truncate(),
+            );
+            let nm = mv3.inverse().transpose();
+            Uniforms {
+                mvp: mvp.to_cols_array_2d(),
+                color,
+                light_dir: light_dir_arr,
+                normal_mat_col0: [nm.x_axis.x, nm.x_axis.y, nm.x_axis.z, 0.0],
+                normal_mat_col1: [nm.y_axis.x, nm.y_axis.y, nm.y_axis.z, 0.0],
+                normal_mat_col2: [nm.z_axis.x, nm.z_axis.y, nm.z_axis.z, 0.0],
+            }
+        };
+
         // Scale that keeps CSYS/planes a constant fraction of the viewport in
         // both perspective and orthographic modes.
         // view_scale = distance × tan(fov/2); objects with this world size
@@ -346,7 +475,7 @@ impl egui_wgpu::CallbackTrait for VpCallback {
         if self.show_csys {
             // Arms = 25% of view_scale → about 12% of viewport height each.
             let model = Mat4::from_scale(Vec3::splat(view_scale * 0.25));
-            let u = Uniforms { mvp: (self.vp * model).to_cols_array_2d(), color: [1.0; 4] };
+            let u = unlit(self.vp * model, [1.0; 4]);
             cmds.push(DrawCmd::Lines { bg: renderer.make_bg(device, &u), count: renderer.axes_count });
         }
 
@@ -371,7 +500,7 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                     contents: bytemuck::cast_slice(&grid),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                let u = Uniforms { mvp: mvp.to_cols_array_2d(), color: [1.0; 4] };
+                let u = unlit(mvp, [1.0; 4]);
                 cmds.push(DrawCmd::DynLines {
                     bg: renderer.make_bg(device, &u),
                     vbuf,
@@ -393,7 +522,7 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                 contents: bytemuck::cast_slice(&wire_verts),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-            let u = Uniforms { mvp: self.vp.to_cols_array_2d(), color: [1.0; 4] };
+            let u = unlit(self.vp, [1.0; 4]);
             cmds.push(DrawCmd::DynLines {
                 bg: renderer.make_bg(device, &u),
                 vbuf,
@@ -404,15 +533,16 @@ impl egui_wgpu::CallbackTrait for VpCallback {
         // ── Edges (cylinders) — rendered first so nodes draw on top ───────
         if !self.edge_segments.is_empty() {
             const SEGS: u32 = 8;
-            let radius = self.edge_thickness;
 
-            let mut verts: Vec<Vtx> = Vec::new();
+            let mut verts: Vec<LitVtx> = Vec::new();
             let mut indices: Vec<u32> = Vec::new();
 
             for (i, &([ax, ay, az], [bx, by, bz])) in self.edge_segments.iter().enumerate() {
                 let (ca, cb) = self.edge_colors.get(i)
                     .copied()
                     .unwrap_or(([0.3, 0.85, 1.0, 1.0], [0.3, 0.85, 1.0, 1.0]));
+
+                let radius = self.edge_thicknesses.get(i).copied().unwrap_or(self.edge_thickness);
 
                 let a = Vec3::new(ax, ay, az);
                 let b = Vec3::new(bx, by, bz);
@@ -421,21 +551,23 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                 if len < 1e-8 { continue; }
 
                 let fwd = dir / len;
-                let up = if fwd.y.abs() < 0.99 { Vec3::Y } else { Vec3::X };
-                let u = fwd.cross(up).normalize();
-                let v = u.cross(fwd);
+                let up_vec = if fwd.y.abs() < 0.99 { Vec3::Y } else { Vec3::X };
+                let u_ax = fwd.cross(up_vec).normalize();
+                let v_ax = u_ax.cross(fwd);
 
                 let base_idx = verts.len() as u32;
 
                 for seg in 0..SEGS {
                     let angle = std::f32::consts::TAU * seg as f32 / SEGS as f32;
                     let (sin_a, cos_a) = angle.sin_cos();
-                    let offset = (u * cos_a + v * sin_a) * radius;
+                    let radial = u_ax * cos_a + v_ax * sin_a;
+                    let offset = radial * radius;
+                    let n = [radial.x, radial.y, radial.z];
 
                     let pa = a + offset;
-                    verts.push(Vtx { pos: [pa.x, pa.y, pa.z], color: ca });
+                    verts.push(LitVtx { pos: [pa.x, pa.y, pa.z], color: ca, normal: n });
                     let pb = b + offset;
-                    verts.push(Vtx { pos: [pb.x, pb.y, pb.z], color: cb });
+                    verts.push(LitVtx { pos: [pb.x, pb.y, pb.z], color: cb, normal: n });
                 }
 
                 for seg in 0..SEGS {
@@ -459,8 +591,9 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                     contents: bytemuck::cast_slice(&indices),
                     usage: wgpu::BufferUsages::INDEX,
                 });
-                let u = Uniforms { mvp: self.vp.to_cols_array_2d(), color: [1.0; 4] };
-                cmds.push(DrawCmd::DynTris {
+                let model = Mat4::IDENTITY;
+                let u = lit(self.vp * model, model, [1.0; 4]);
+                cmds.push(DrawCmd::LitTris {
                     bg: renderer.make_bg(device, &u),
                     vbuf,
                     ibuf,
@@ -475,20 +608,14 @@ impl egui_wgpu::CallbackTrait for VpCallback {
             let model = Mat4::from_translation(Vec3::new(x, y, z))
                 * Mat4::from_scale(Vec3::splat(self.node_size * size_scale));
             let color = self.node_colors.get(ni).copied().unwrap_or([1.0, 0.85, 0.1, 1.0]);
-            let u = Uniforms {
-                mvp: (self.vp * model).to_cols_array_2d(),
-                color,
-            };
+            let u = lit(self.vp * model, model, color);
             cmds.push(DrawCmd::Sphere { bg: renderer.make_bg(device, &u) });
 
             // Highlight ring for all selected nodes
             if self.selected_nodes.get(ni).copied().unwrap_or(false) {
                 let highlight_model = Mat4::from_translation(Vec3::new(x, y, z))
                     * Mat4::from_scale(Vec3::splat(self.node_size * size_scale * 1.5));
-                let hu = Uniforms {
-                    mvp: (self.vp * highlight_model).to_cols_array_2d(),
-                    color: [1.0, 0.9, 0.3, 1.0],  // yellow highlight for selection
-                };
+                let hu = lit(self.vp * highlight_model, highlight_model, [1.0, 0.9, 0.3, 1.0]);
                 cmds.push(DrawCmd::Sphere { bg: renderer.make_bg(device, &hu) });
             }
 
@@ -519,7 +646,7 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                                 contents: bytemuck::cast_slice(&local_axis_verts),
                                 usage: wgpu::BufferUsages::VERTEX,
                             });
-                            let u = Uniforms { mvp: self.vp.to_cols_array_2d(), color: [1.0; 4] };
+                            let u = unlit(self.vp, [1.0; 4]);
                             cmds.push(DrawCmd::DynLines {
                                 bg: renderer.make_bg(device, &u),
                                 vbuf,
@@ -535,17 +662,14 @@ impl egui_wgpu::CallbackTrait for VpCallback {
         for (gi, &(pos, ref shape, color, size, stretch, tube_ratio)) in self.glyphs.iter().enumerate() {
             let model = Mat4::from_translation(Vec3::from(pos))
                 * Mat4::from_scale(Vec3::new(size * stretch[0], size * stretch[1], size * stretch[2]));
-            let u = Uniforms {
-                mvp: (self.vp * model).to_cols_array_2d(),
-                color,
-            };
+            let u = lit(self.vp * model, model, color);
 
             match shape {
                 GlyphShape::Sphere => {
                     cmds.push(DrawCmd::Sphere { bg: renderer.make_bg(device, &u) });
                 }
                 GlyphShape::Cube => {
-                    let (verts, indices) = make_cube(color);
+                    let (verts, indices) = make_cube([1.0; 4]);
                     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("glyph_cube_v"),
                         contents: bytemuck::cast_slice(&verts),
@@ -556,13 +680,13 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                         contents: bytemuck::cast_slice(&indices),
                         usage: wgpu::BufferUsages::INDEX,
                     });
-                    cmds.push(DrawCmd::DynTris {
+                    cmds.push(DrawCmd::LitTris {
                         bg: renderer.make_bg(device, &u),
                         vbuf, ibuf, icount: indices.len() as u32,
                     });
                 }
                 GlyphShape::Cylinder => {
-                    let (verts, indices) = make_cylinder(16, color);
+                    let (verts, indices) = make_cylinder(16, [1.0; 4]);
                     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("glyph_cyl_v"),
                         contents: bytemuck::cast_slice(&verts),
@@ -573,13 +697,13 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                         contents: bytemuck::cast_slice(&indices),
                         usage: wgpu::BufferUsages::INDEX,
                     });
-                    cmds.push(DrawCmd::DynTris {
+                    cmds.push(DrawCmd::LitTris {
                         bg: renderer.make_bg(device, &u),
                         vbuf, ibuf, icount: indices.len() as u32,
                     });
                 }
                 GlyphShape::Torus => {
-                    let (verts, indices) = make_torus(16, 8, tube_ratio, color);
+                    let (verts, indices) = make_torus(16, 8, tube_ratio, [1.0; 4]);
                     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("glyph_tor_v"),
                         contents: bytemuck::cast_slice(&verts),
@@ -590,7 +714,7 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                         contents: bytemuck::cast_slice(&indices),
                         usage: wgpu::BufferUsages::INDEX,
                     });
-                    cmds.push(DrawCmd::DynTris {
+                    cmds.push(DrawCmd::LitTris {
                         bg: renderer.make_bg(device, &u),
                         vbuf, ibuf, icount: indices.len() as u32,
                     });
@@ -601,23 +725,39 @@ impl egui_wgpu::CallbackTrait for VpCallback {
             if self.glyph_selected.get(gi).copied().unwrap_or(false) {
                 let hm = Mat4::from_translation(Vec3::from(pos))
                     * Mat4::from_scale(Vec3::splat(size * 1.3));
-                let hu = Uniforms {
-                    mvp: (self.vp * hm).to_cols_array_2d(),
-                    color: [1.0, 0.6, 0.2, 1.0],
-                };
+                let hu = lit(self.vp * hm, hm, [1.0, 0.6, 0.2, 1.0]);
                 cmds.push(DrawCmd::Sphere { bg: renderer.make_bg(device, &hu) });
             }
         }
 
-        // ── Mesh surfaces ──────────────────────────────────────────────────
+        // ── Mesh surfaces (lit with per-face normals) ──────────────────────
         for mesh in &self.mesh_surfaces {
             if mesh.indices.is_empty() || mesh.verts.is_empty() { continue; }
-            let verts: Vec<Vtx> = mesh.verts.iter().map(|v| {
-                Vtx { pos: [v[0], v[1], v[2]], color: [v[3], v[4], v[5], v[6]] }
+            // Build LitVtx with per-face normals.
+            let positions: Vec<[f32; 3]> = mesh.verts.iter().map(|v| [v[0], v[1], v[2]]).collect();
+            let colors: Vec<[f32; 4]> = mesh.verts.iter().map(|v| [v[3], v[4], v[5], v[6]]).collect();
+            // Accumulate face normals per vertex.
+            let mut normals = vec![[0.0f32; 3]; positions.len()];
+            for tri in mesh.indices.chunks(3) {
+                if tri.len() < 3 { continue; }
+                let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                let a = Vec3::from(positions[i0]);
+                let b = Vec3::from(positions[i1]);
+                let c = Vec3::from(positions[i2]);
+                let n = (b - a).cross(c - a);
+                for &idx in &[i0, i1, i2] {
+                    normals[idx][0] += n.x;
+                    normals[idx][1] += n.y;
+                    normals[idx][2] += n.z;
+                }
+            }
+            let lit_verts: Vec<LitVtx> = positions.iter().zip(colors.iter()).zip(normals.iter()).map(|((&p, &c), n)| {
+                let len = (n[0]*n[0] + n[1]*n[1] + n[2]*n[2]).sqrt().max(1e-8);
+                LitVtx { pos: p, color: c, normal: [n[0]/len, n[1]/len, n[2]/len] }
             }).collect();
             let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh_v"),
-                contents: bytemuck::cast_slice(&verts),
+                contents: bytemuck::cast_slice(&lit_verts),
                 usage: wgpu::BufferUsages::VERTEX,
             });
             let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -625,10 +765,79 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                 contents: bytemuck::cast_slice(&mesh.indices),
                 usage: wgpu::BufferUsages::INDEX,
             });
-            let u = Uniforms { mvp: self.vp.to_cols_array_2d(), color: [1.0; 4] };
-            cmds.push(DrawCmd::DynTris {
+            let model = Mat4::IDENTITY;
+            let u = lit(self.vp * model, model, [1.0; 4]);
+            cmds.push(DrawCmd::LitTris {
                 bg: renderer.make_bg(device, &u),
                 vbuf, ibuf, icount: mesh.indices.len() as u32,
+            });
+        }
+
+        // ── Vector arrows ──────────────────────────────────────────────────
+        let (cone_verts, cone_indices) = make_cone(12);
+        let (cyl_verts,  cyl_indices)  = make_cylinder(8, [1.0; 4]);
+        for &(pos, dir, color, length) in &self.arrows {
+            if length < 1e-9 { continue; }
+            let dir_vec = Vec3::from(dir);
+            // Rotation from +Y to dir.
+            let base_rot = if dir_vec.dot(Vec3::Y) > 0.9999 {
+                Mat4::IDENTITY
+            } else if dir_vec.dot(Vec3::Y) < -0.9999 {
+                Mat4::from_axis_angle(Vec3::X, std::f32::consts::PI)
+            } else {
+                Mat4::from_quat(glam::Quat::from_rotation_arc(Vec3::Y, dir_vec))
+            };
+            let base = Mat4::from_translation(Vec3::from(pos)) * base_rot * Mat4::from_scale(Vec3::splat(length));
+
+            // Shaft: cylinder occupies y ∈ [-1, 1] centred at origin; scale and
+            // translate so it spans y ∈ [0, 0.75] in arrow space.
+            const SHAFT_R: f32 = 0.04;
+            const SHAFT_HALF: f32 = 0.375; // half-height of shaft in arrow space
+            let shaft_local = Mat4::from_translation(Vec3::new(0.0, SHAFT_HALF, 0.0))
+                * Mat4::from_scale(Vec3::new(SHAFT_R, SHAFT_HALF, SHAFT_R));
+            let shaft_model = base * shaft_local;
+            // Rebuild the cylinder with the arrow's colour.
+            let shaft_colored: Vec<LitVtx> = cyl_verts.iter()
+                .map(|v| LitVtx { pos: v.pos, color, normal: v.normal })
+                .collect();
+            let sv = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("arrow_shaft_v"),
+                contents: bytemuck::cast_slice(&shaft_colored),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let si = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("arrow_shaft_i"),
+                contents: bytemuck::cast_slice(&cyl_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            cmds.push(DrawCmd::LitTris {
+                bg: renderer.make_bg(device, &lit(self.vp * shaft_model, shaft_model, color)),
+                vbuf: sv, ibuf: si, icount: cyl_indices.len() as u32,
+            });
+
+            // Cone tip: spans y ∈ [0, 1] in cone space; translate to y=0.75
+            // and scale so it spans y ∈ [0.75, 1.0] in arrow space.
+            const CONE_R: f32 = 0.12;
+            const CONE_H: f32 = 0.25; // cone height in arrow space
+            let cone_local = Mat4::from_translation(Vec3::new(0.0, 0.75, 0.0))
+                * Mat4::from_scale(Vec3::new(CONE_R, CONE_H, CONE_R));
+            let cone_model = base * cone_local;
+            let cone_colored: Vec<LitVtx> = cone_verts.iter()
+                .map(|v| LitVtx { pos: v.pos, color, normal: v.normal })
+                .collect();
+            let cv = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("arrow_cone_v"),
+                contents: bytemuck::cast_slice(&cone_colored),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            let ci = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("arrow_cone_i"),
+                contents: bytemuck::cast_slice(&cone_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+            cmds.push(DrawCmd::LitTris {
+                bg: renderer.make_bg(device, &lit(self.vp * cone_model, cone_model, color)),
+                vbuf: cv, ibuf: ci, icount: cone_indices.len() as u32,
             });
         }
 
@@ -654,7 +863,7 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                     pass.draw(0..*count, 0..1);
                 }
                 DrawCmd::Sphere { bg } => {
-                    pass.set_pipeline(&renderer.tri_pipeline);
+                    pass.set_pipeline(&renderer.lit_tri_pipeline);
                     pass.set_bind_group(0, bg, &[]);
                     pass.set_vertex_buffer(0, renderer.sphere_vbuf.slice(..));
                     pass.set_index_buffer(renderer.sphere_ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -668,6 +877,13 @@ impl egui_wgpu::CallbackTrait for VpCallback {
                 }
                 DrawCmd::DynTris { bg, vbuf, ibuf, icount } => {
                     pass.set_pipeline(&renderer.tri_pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.set_vertex_buffer(0, vbuf.slice(..));
+                    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..*icount, 0, 0..1);
+                }
+                DrawCmd::LitTris { bg, vbuf, ibuf, icount } => {
+                    pass.set_pipeline(&renderer.lit_tri_pipeline);
                     pass.set_bind_group(0, bg, &[]);
                     pass.set_vertex_buffer(0, vbuf.slice(..));
                     pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
@@ -704,6 +920,8 @@ pub struct ViewportResponse {
     pub rect: egui::Rect,
     /// If the user chose a different distance unit via the context menu.
     pub unit_change: Option<DistanceUnit>,
+    /// If the user toggled directional lighting via the context menu.
+    pub lighting_toggled: Option<bool>,
 }
 
 pub fn show_viewport(
@@ -721,6 +939,7 @@ pub fn show_viewport(
     local_csys_scale: f32,
     select_mode:      bool,
     edge_thickness:   f32,
+    edge_thicknesses: &[f32],
     viewport_bg:      [f32; 3],
     mmb_orbit:        bool,
     glyph_positions:  &[([f32; 3], GlyphShape, [f32; 4], f32, [f32; 3], f32)],
@@ -729,6 +948,15 @@ pub fn show_viewport(
     wireframe_edges:  &[([f32; 3], [f32; 3])],
     unit_label:       &str,
     current_unit:     &DistanceUnit,
+    light_brightness: f32,
+    lighting_enabled: bool,
+    node_labels:      &[String],
+    edge_labels:      &[String],
+    glyph_labels:     &[String],
+    mesh_labels:      &[String],
+    arrows:           Vec<([f32; 3], [f32; 3], [f32; 4], f32)>,
+    scene_center:     [f32; 3],
+    scene_radius:     f32,
 ) -> ViewportResponse {
     let rect = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
@@ -745,6 +973,7 @@ pub fn show_viewport(
     );
 
     let mut unit_change: Option<DistanceUnit> = None;
+    let mut lighting_toggled: Option<bool> = None;
 
     // Right-click context menu
     response.context_menu(|ui| {
@@ -762,14 +991,42 @@ pub fn show_viewport(
         ui.radio_value(&mut state.orthographic, false, "Perspective");
         ui.radio_value(&mut state.orthographic, true,  "Orthographic");
         ui.separator();
-        ui.label("Model Unit");
-        for u in DistanceUnit::ALL {
-            let selected = current_unit == u;
-            if ui.selectable_label(selected, u.label()).clicked() && !selected {
-                unit_change = Some(u.clone());
-                ui.close_menu();
+        ui.menu_button(format!("Model Unit ({})", current_unit.label()), |ui| {
+            for u in DistanceUnit::ALL {
+                let selected = current_unit == u;
+                if ui.selectable_label(selected, u.label()).clicked() && !selected {
+                    unit_change = Some(u.clone());
+                    ui.close_menu();
+                }
             }
+        });
+        ui.separator();
+        ui.label("Camera");
+        if ui.button("Focus on Model").clicked() {
+            state.target   = Vec3::from(scene_center);
+            state.distance = (scene_radius * 2.5).max(0.01);
+            ui.close_menu();
         }
+        if ui.button("Set Orbit Center (next click)").clicked() {
+            state.pick_orbit_center = true;
+            ui.close_menu();
+        }
+        if ui.button("Reset Orbit Center").clicked() {
+            state.target = Vec3::from(scene_center);
+            ui.close_menu();
+        }
+        ui.separator();
+        let mut lit = lighting_enabled;
+        if ui.checkbox(&mut lit, "Directional Lighting").changed() {
+            lighting_toggled = Some(lit);
+        }
+        ui.separator();
+        ui.menu_button("Labels", |ui| {
+            ui.checkbox(&mut state.show_node_numbers,  format!("{} Nodes",  egui_phosphor::regular::HEXAGON));
+            ui.checkbox(&mut state.show_edge_numbers,  format!("{} Edges",  egui_phosphor::regular::LINE_SEGMENT));
+            ui.checkbox(&mut state.show_glyph_numbers, format!("{} Glyphs", egui_phosphor::regular::DIAMOND));
+            ui.checkbox(&mut state.show_mesh_numbers,  format!("{} Meshes", egui_phosphor::regular::POLYGON));
+        });
     });
 
     let mut clicked_pos:      Option<egui::Pos2>  = None;
@@ -874,28 +1131,56 @@ pub fn show_viewport(
         }
     }
 
-    // Pan
+    // Pan — scale by the larger of the current distance or a minimum based on
+    // scene size, so pan remains usable even when zoomed in very close.
     let pan_btn = if mmb_orbit { egui::PointerButton::Secondary } else { egui::PointerButton::Middle };
     if response.dragged_by(pan_btn) {
         let d = response.drag_delta();
         let right = Vec3::new(state.azimuth.cos(), 0.0, -state.azimuth.sin());
-        state.target -= right   * d.x * state.distance * 0.001;
-        state.target += Vec3::Y * d.y * state.distance * 0.001;
+        let pan_scale = state.distance.max(scene_radius * 0.005) * 0.001;
+        state.target -= right   * d.x * pan_scale;
+        state.target += Vec3::Y * d.y * pan_scale;
     }
 
     // Zoom (scroll)
     let scroll = ui.input(|i| i.raw_scroll_delta.y);
     if response.hovered() && scroll.abs() > 0.0 {
-        state.distance = (state.distance * (1.0 - scroll * 0.001)).clamp(1e-6, 1e6);
+        let prev_dist = state.distance;
+        let min_dist  = scene_radius * 1e-3;
+        let max_dist  = scene_radius * 500.0;
+        state.distance = (state.distance * (1.0 - scroll * 0.001)).clamp(min_dist.max(1e-6), max_dist.max(1.0));
+
+        // In perspective: dolly the orbit center forward as the camera zooms in
+        // so the pivot advances into the scene and zoom never "bottoms out".
+        if !state.orthographic {
+            let dist_delta = prev_dist - state.distance; // positive = zoomed in
+            if dist_delta.abs() > 1e-8 {
+                let look = (state.target - state.eye()).normalize();
+                state.target += look * dist_delta * 0.6;
+            }
+        }
     }
+
+    // Pre-compute mesh label anchor (centroid) from each surface's vertices,
+    // before mesh_surfaces is moved into the wgpu callback.
+    let mesh_centroids: Vec<Option<[f32; 3]>> = mesh_surfaces.iter().map(|ms| {
+        if ms.verts.is_empty() { return None; }
+        let n = ms.verts.len() as f32;
+        Some([
+            ms.verts.iter().map(|v| v[0]).sum::<f32>() / n,
+            ms.verts.iter().map(|v| v[1]).sum::<f32>() / n,
+            ms.verts.iter().map(|v| v[2]).sum::<f32>() / n,
+        ])
+    }).collect();
 
     // Issue wgpu callback
     let aspect = rect.width() / rect.height().max(1.0);
-    let vp = state.proj_matrix(aspect) * state.view_matrix();
+    let vp = state.proj_matrix(aspect, scene_radius) * state.view_matrix();
     ui.painter().add(egui_wgpu::Callback::new_paint_callback(
         rect,
         VpCallback {
             vp,
+            view:              state.view_matrix(),
             show_csys:         state.show_csys,
             show_local_csys:   state.show_local_csys,
             show_xy:           state.show_xy,
@@ -913,10 +1198,13 @@ pub fn show_viewport(
             node_size,
             local_csys_scale,
             edge_thickness,
+            edge_thicknesses:  edge_thicknesses.to_vec(),
             glyphs:            glyph_positions.to_vec(),
             glyph_selected:    glyph_selected.to_vec(),
             mesh_surfaces,
             wireframe_edges:   wireframe_edges.to_vec(),
+            light_brightness,
+            arrows,
         },
     ));
 
@@ -1051,7 +1339,133 @@ pub fn show_viewport(
         ctrl_clicked_pos = None;
     }
 
-    ViewportResponse { clicked_pos, ctrl_clicked_pos, rect_selection, vp, rect, unit_change }
+    // ── World→screen projection (shared by labels and orbit-center pick) ────
+    let proj_half_w = rect.width()  * 0.5;
+    let proj_half_h = rect.height() * 0.5;
+    let project = |p: [f32; 3]| -> Option<egui::Pos2> {
+        let clip = vp * Vec4::new(p[0], p[1], p[2], 1.0);
+        if clip.w <= 0.0 { return None; }
+        let ndx = clip.x / clip.w;
+        let ndy = clip.y / clip.w;
+        if ndx < -1.05 || ndx > 1.05 || ndy < -1.05 || ndy > 1.05 { return None; }
+        Some(egui::pos2(
+            rect.left() + proj_half_w * (1.0 + ndx),
+            rect.top()  + proj_half_h * (1.0 - ndy),
+        ))
+    };
+
+    // ── Number label overlay ─────────────────────────────────────────────────
+    let any_labels = state.show_node_numbers
+        || state.show_edge_numbers
+        || state.show_glyph_numbers
+        || state.show_mesh_numbers;
+    if any_labels {
+        let label_font = egui::FontId::monospace(11.0);
+        let bg_color   = egui::Color32::from_black_alpha(150);
+        let fg_color   = egui::Color32::from_rgb(230, 230, 230);
+        let painter    = ui.painter_at(rect);
+        let half_w     = rect.width()  * 0.5;
+        let half_h     = rect.height() * 0.5;
+        // Re-define project with the local half_w/half_h for this block.
+        let project = |p: [f32; 3]| -> Option<egui::Pos2> {
+            let clip = vp * Vec4::new(p[0], p[1], p[2], 1.0);
+            if clip.w <= 0.0 { return None; }
+            let ndx = clip.x / clip.w;
+            let ndy = clip.y / clip.w;
+            if ndx < -1.05 || ndx > 1.05 || ndy < -1.05 || ndy > 1.05 { return None; }
+            Some(egui::pos2(
+                rect.left() + half_w * (1.0 + ndx),
+                rect.top()  + half_h * (1.0 - ndy),
+            ))
+        };
+
+        // Draw a small label with a dark background pill at the given screen pos.
+        let draw_label = |painter: &egui::Painter, screen: egui::Pos2, text: &str| {
+            let p = screen + egui::vec2(6.0, -6.0);
+            let galley = painter.layout_no_wrap(
+                text.to_string(), label_font.clone(), fg_color,
+            );
+            let pad = egui::vec2(3.0, 2.0);
+            let bg = egui::Rect::from_min_size(p - pad, galley.size() + pad * 2.0);
+            painter.rect_filled(bg, 2.0, bg_color);
+            painter.galley(p, galley, fg_color);
+        };
+
+        if state.show_node_numbers {
+            for (pos, label) in nodes.iter().zip(node_labels.iter()) {
+                if let Some(sp) = project(*pos) {
+                    draw_label(&painter, sp, label);
+                }
+            }
+        }
+
+        if state.show_edge_numbers {
+            for (&(a, b), label) in edge_segments.iter().zip(edge_labels.iter()) {
+                let mid = [
+                    (a[0] + b[0]) * 0.5,
+                    (a[1] + b[1]) * 0.5,
+                    (a[2] + b[2]) * 0.5,
+                ];
+                if let Some(sp) = project(mid) {
+                    draw_label(&painter, sp, label);
+                }
+            }
+        }
+
+        if state.show_glyph_numbers {
+            for (gd, label) in glyph_positions.iter().zip(glyph_labels.iter()) {
+                if let Some(sp) = project(gd.0) {
+                    draw_label(&painter, sp, label);
+                }
+            }
+        }
+
+        if state.show_mesh_numbers {
+            for (centroid_opt, label) in mesh_centroids.iter().zip(mesh_labels.iter()) {
+                if let Some(centroid) = centroid_opt {
+                    if let Some(sp) = project(*centroid) {
+                        draw_label(&painter, sp, label);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Orbit-center pick mode ───────────────────────────────────────────────
+    // When active, any click snaps the orbit target to the nearest visible node.
+    // If no node is within 40 px of the click, fall back to the scene centre.
+    if state.pick_orbit_center {
+        // Tint the viewport border to hint that something is active.
+        ui.painter().rect_stroke(
+            rect,
+            0.0,
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 200, 60)),
+            egui::StrokeKind::Inside,
+        );
+
+        let maybe_click = if let Some(click) = clicked_pos.take() {
+            Some(click)
+        } else if let Some(click) = ctrl_clicked_pos.take() {
+            Some(click)
+        } else {
+            None
+        };
+
+        if let Some(click) = maybe_click {
+            let best = nodes.iter().filter_map(|&n| {
+                project(n).map(|sp| (Vec3::from(n), (sp - click).length()))
+            }).min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+            state.target = if let Some((pos, dist)) = best {
+                if dist < 40.0 { pos } else { Vec3::from(scene_center) }
+            } else {
+                Vec3::from(scene_center)
+            };
+            state.pick_orbit_center = false;
+        }
+    }
+
+    ViewportResponse { clicked_pos, ctrl_clicked_pos, rect_selection, vp, rect, unit_change, lighting_toggled }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1291,8 +1705,8 @@ fn make_axes(len: f32) -> (Vec<Vtx>, u32) {
 
 
 
-/// Subdivided icosahedron.
-fn icosphere(subs: u32) -> (Vec<Vtx>, Vec<u32>) {
+/// Subdivided icosahedron with normals (normal = normalized position for a unit sphere).
+fn icosphere(subs: u32) -> (Vec<LitVtx>, Vec<u32>) {
     let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
     let mut pos: Vec<[f32; 3]> = vec![
         [-1.0, t, 0.0],[1.0, t, 0.0],[-1.0,-t, 0.0],[1.0,-t, 0.0],
@@ -1326,29 +1740,29 @@ fn icosphere(subs: u32) -> (Vec<Vtx>, Vec<u32>) {
         idx = new_idx;
     }
 
-    let verts: Vec<Vtx> = pos.iter().map(|&p| {
+    let verts: Vec<LitVtx> = pos.iter().map(|&p| {
         let n=norm(p);
-        Vtx { pos: n, color: [1.0, 1.0, 1.0, 1.0] }
+        LitVtx { pos: n, color: [1.0, 1.0, 1.0, 1.0], normal: n }
     }).collect();
     (verts, idx)
 }
 
-/// Unit cube centred at origin (half-extent = 1).
-fn make_cube(color: [f32; 4]) -> (Vec<Vtx>, Vec<u32>) {
-    let v = |x: f32, y: f32, z: f32| Vtx { pos: [x, y, z], color };
+/// Unit cube centred at origin (half-extent = 1) with per-face normals.
+fn make_cube(color: [f32; 4]) -> (Vec<LitVtx>, Vec<u32>) {
+    let v = |x: f32, y: f32, z: f32, nx: f32, ny: f32, nz: f32| LitVtx { pos: [x, y, z], color, normal: [nx, ny, nz] };
     let verts = vec![
         // front (+Z)
-        v(-1.0, -1.0,  1.0), v( 1.0, -1.0,  1.0), v( 1.0,  1.0,  1.0), v(-1.0,  1.0,  1.0),
+        v(-1.0, -1.0,  1.0, 0.0, 0.0, 1.0), v( 1.0, -1.0,  1.0, 0.0, 0.0, 1.0), v( 1.0,  1.0,  1.0, 0.0, 0.0, 1.0), v(-1.0,  1.0,  1.0, 0.0, 0.0, 1.0),
         // back (-Z)
-        v( 1.0, -1.0, -1.0), v(-1.0, -1.0, -1.0), v(-1.0,  1.0, -1.0), v( 1.0,  1.0, -1.0),
+        v( 1.0, -1.0, -1.0, 0.0, 0.0,-1.0), v(-1.0, -1.0, -1.0, 0.0, 0.0,-1.0), v(-1.0,  1.0, -1.0, 0.0, 0.0,-1.0), v( 1.0,  1.0, -1.0, 0.0, 0.0,-1.0),
         // top (+Y)
-        v(-1.0,  1.0,  1.0), v( 1.0,  1.0,  1.0), v( 1.0,  1.0, -1.0), v(-1.0,  1.0, -1.0),
+        v(-1.0,  1.0,  1.0, 0.0, 1.0, 0.0), v( 1.0,  1.0,  1.0, 0.0, 1.0, 0.0), v( 1.0,  1.0, -1.0, 0.0, 1.0, 0.0), v(-1.0,  1.0, -1.0, 0.0, 1.0, 0.0),
         // bottom (-Y)
-        v(-1.0, -1.0, -1.0), v( 1.0, -1.0, -1.0), v( 1.0, -1.0,  1.0), v(-1.0, -1.0,  1.0),
+        v(-1.0, -1.0, -1.0, 0.0,-1.0, 0.0), v( 1.0, -1.0, -1.0, 0.0,-1.0, 0.0), v( 1.0, -1.0,  1.0, 0.0,-1.0, 0.0), v(-1.0, -1.0,  1.0, 0.0,-1.0, 0.0),
         // right (+X)
-        v( 1.0, -1.0,  1.0), v( 1.0, -1.0, -1.0), v( 1.0,  1.0, -1.0), v( 1.0,  1.0,  1.0),
+        v( 1.0, -1.0,  1.0, 1.0, 0.0, 0.0), v( 1.0, -1.0, -1.0, 1.0, 0.0, 0.0), v( 1.0,  1.0, -1.0, 1.0, 0.0, 0.0), v( 1.0,  1.0,  1.0, 1.0, 0.0, 0.0),
         // left (-X)
-        v(-1.0, -1.0, -1.0), v(-1.0, -1.0,  1.0), v(-1.0,  1.0,  1.0), v(-1.0,  1.0, -1.0),
+        v(-1.0, -1.0, -1.0,-1.0, 0.0, 0.0), v(-1.0, -1.0,  1.0,-1.0, 0.0, 0.0), v(-1.0,  1.0,  1.0,-1.0, 0.0, 0.0), v(-1.0,  1.0, -1.0,-1.0, 0.0, 0.0),
     ];
     let mut indices = Vec::new();
     for face in 0..6u32 {
@@ -1358,43 +1772,94 @@ fn make_cube(color: [f32; 4]) -> (Vec<Vtx>, Vec<u32>) {
     (verts, indices)
 }
 
-/// Cylinder along Y axis, radius=1, height=2 (centred at origin).
-fn make_cylinder(segs: u32, color: [f32; 4]) -> (Vec<Vtx>, Vec<u32>) {
+/// Cylinder along Y axis, radius=1, height=2 (centred at origin), with normals.
+fn make_cylinder(segs: u32, color: [f32; 4]) -> (Vec<LitVtx>, Vec<u32>) {
     let mut verts = Vec::new();
     let mut indices = Vec::new();
     // Top and bottom cap centres
     let top_c = verts.len() as u32;
-    verts.push(Vtx { pos: [0.0,  1.0, 0.0], color });
+    verts.push(LitVtx { pos: [0.0,  1.0, 0.0], color, normal: [0.0, 1.0, 0.0] });
     let bot_c = verts.len() as u32;
-    verts.push(Vtx { pos: [0.0, -1.0, 0.0], color });
+    verts.push(LitVtx { pos: [0.0, -1.0, 0.0], color, normal: [0.0,-1.0, 0.0] });
 
-    let ring_base = verts.len() as u32;
+    // Side ring vertices (with radial normals) + cap ring vertices (with Y normals)
+    let side_base = verts.len() as u32;
     for i in 0..segs {
         let angle = std::f32::consts::TAU * i as f32 / segs as f32;
         let (s, c_val) = angle.sin_cos();
-        verts.push(Vtx { pos: [c_val,  1.0, s], color }); // top ring
-        verts.push(Vtx { pos: [c_val, -1.0, s], color }); // bottom ring
+        // Side top and bottom
+        verts.push(LitVtx { pos: [c_val,  1.0, s], color, normal: [c_val, 0.0, s] });
+        verts.push(LitVtx { pos: [c_val, -1.0, s], color, normal: [c_val, 0.0, s] });
+    }
+    // Cap vertices (separate so they have Y-facing normals)
+    let cap_base = verts.len() as u32;
+    for i in 0..segs {
+        let angle = std::f32::consts::TAU * i as f32 / segs as f32;
+        let (s, c_val) = angle.sin_cos();
+        verts.push(LitVtx { pos: [c_val,  1.0, s], color, normal: [0.0, 1.0, 0.0] }); // top cap
+        verts.push(LitVtx { pos: [c_val, -1.0, s], color, normal: [0.0,-1.0, 0.0] }); // bottom cap
     }
     for i in 0..segs {
         let next = (i + 1) % segs;
-        let ti = ring_base + i * 2;
-        let bi = ring_base + i * 2 + 1;
-        let tn = ring_base + next * 2;
-        let bn = ring_base + next * 2 + 1;
+        let ti = side_base + i * 2;
+        let bi = side_base + i * 2 + 1;
+        let tn = side_base + next * 2;
+        let bn = side_base + next * 2 + 1;
         // Side quad
         indices.extend_from_slice(&[ti, bi, bn,  ti, bn, tn]);
-        // Top cap
-        indices.extend_from_slice(&[top_c, ti, tn]);
+        // Top cap (using cap ring vertices)
+        let cti = cap_base + i * 2;
+        let ctn = cap_base + next * 2;
+        indices.extend_from_slice(&[top_c, cti, ctn]);
         // Bottom cap
-        indices.extend_from_slice(&[bot_c, bn, bi]);
+        let cbi = cap_base + i * 2 + 1;
+        let cbn = cap_base + next * 2 + 1;
+        indices.extend_from_slice(&[bot_c, cbn, cbi]);
     }
     (verts, indices)
 }
 
-/// Torus in the XZ plane, centred at origin.
+/// Torus in the XZ plane, centred at origin, with normals.
 /// `major_segs` = divisions around the ring, `minor_segs` = divisions of the tube cross-section.
 /// `tube_ratio` = tube_radius / major_radius (the overall radius is 1.0).
-fn make_torus(major_segs: u32, minor_segs: u32, tube_ratio: f32, color: [f32; 4]) -> (Vec<Vtx>, Vec<u32>) {
+/// Cone with tip at (0, 1, 0), base centre at origin, base radius = 1.
+/// Colour is set per-vertex at call time; the caller overwrites it before uploading.
+/// Normals are computed for a unit 45° half-angle cone (H = R = 1).
+fn make_cone(segs: u32) -> (Vec<LitVtx>, Vec<u32>) {
+    use std::f32::consts::TAU;
+    // For H=R=1 the outward side normal at azimuth φ is (cos(φ)/√2, 1/√2, sin(φ)/√2).
+    let slope: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    let placeholder = [1.0_f32; 4]; // colour filled in by caller
+    let mut verts: Vec<LitVtx> = Vec::new();
+    let mut indices: Vec<u32>  = Vec::new();
+
+    let tip = verts.len() as u32;
+    verts.push(LitVtx { pos: [0.0, 1.0, 0.0], color: placeholder, normal: [0.0, 1.0, 0.0] });
+    let base_c = verts.len() as u32;
+    verts.push(LitVtx { pos: [0.0, 0.0, 0.0], color: placeholder, normal: [0.0, -1.0, 0.0] });
+
+    let side_base = verts.len() as u32;
+    for i in 0..segs {
+        let a = TAU * i as f32 / segs as f32;
+        let (s, c) = a.sin_cos();
+        verts.push(LitVtx { pos: [c, 0.0, s], color: placeholder, normal: [c * slope, slope, s * slope] });
+    }
+    let cap_base = verts.len() as u32;
+    for i in 0..segs {
+        let a = TAU * i as f32 / segs as f32;
+        let (s, c) = a.sin_cos();
+        verts.push(LitVtx { pos: [c, 0.0, s], color: placeholder, normal: [0.0, -1.0, 0.0] });
+    }
+
+    for i in 0..segs {
+        let next = (i + 1) % segs;
+        indices.extend_from_slice(&[tip, side_base + i, side_base + next]);
+        indices.extend_from_slice(&[base_c, cap_base + next, cap_base + i]);
+    }
+    (verts, indices)
+}
+
+fn make_torus(major_segs: u32, minor_segs: u32, tube_ratio: f32, color: [f32; 4]) -> (Vec<LitVtx>, Vec<u32>) {
     let major_r = 1.0;
     let minor_r = major_r * tube_ratio;
     let mut verts = Vec::new();
@@ -1409,7 +1874,11 @@ fn make_torus(major_segs: u32, minor_segs: u32, tube_ratio: f32, color: [f32; 4]
             let x = (major_r + minor_r * cp) * ct;
             let y = minor_r * sp;
             let z = (major_r + minor_r * cp) * st;
-            verts.push(Vtx { pos: [x, y, z], color });
+            // Normal points outward from the tube centre at (major_r*ct, 0, major_r*st)
+            let nx = cp * ct;
+            let ny = sp;
+            let nz = cp * st;
+            verts.push(LitVtx { pos: [x, y, z], color, normal: [nx, ny, nz] });
         }
     }
 

@@ -1,4 +1,4 @@
-use crate::data::{max_duration, sample_qualified, show_import_panel, Dataset};
+use crate::data::{max_duration, sample_qualified, sample_velocity_qualified, sample_acceleration_qualified, show_import_panel, Dataset};
 use crate::table::{row_position, show_top_pane, Edge, Row, Glyph, GlyphShape, Mesh, TableTab, identity_mat3};
 use crate::viewport::{show_viewport, MeshRenderData, Viewport3D};
 use crate::persist::{UserPrefs, ModelFile, SavedView, DistanceUnit, show_options_window, show_views_window};
@@ -12,6 +12,15 @@ use crate::export_video::{
     ExportVideoState, ExportPhase, ExportAction,
     show_export_video_window, process_screenshot, run_ffmpeg_encode,
 };
+
+/// How to compute the "maximum displacement" frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MaxDispMode {
+    /// Peak displacement at any single node at any time step.
+    Local,
+    /// Time step with the highest average displacement across all nodes.
+    Average,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Animation state
@@ -106,6 +115,7 @@ pub enum InteractionTool {
     None,
     Details,
     Select,
+    CreateEdges,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -119,6 +129,13 @@ pub enum SelectionFilter {
 // ─────────────────────────────────────────────────────────────────────────────
 // Visualisation mode
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum VectorVisMode {
+    #[default]
+    Velocity,
+    Acceleration,
+}
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum VisMode {
@@ -255,6 +272,7 @@ pub struct App {
     selected_node:     Option<usize>,
     selected_glyph:    Option<usize>,
     selected_edge:     Option<usize>,
+    max_disp_mode:     MaxDispMode,
 
     // Persistence
     prefs:            UserPrefs,
@@ -286,12 +304,21 @@ pub struct App {
     // Viewport interaction mode
     interaction_tool:    InteractionTool,
     selection_filter:    SelectionFilter,
+    // Create-edges tool state
+    edge_create_chain:     bool,
+    edge_create_prev_node: Option<usize>,
 
     // FFT analysis
     fft_state: FftPaneState,
 
     // Wireframe overlay
     show_wireframe:      bool,
+
+    // Vector vis
+    show_vectors:        bool,
+    vector_vis_mode:     VectorVisMode,
+    vector_scale:        f32,
+    vector_use_contour:  bool,
 
     // Export Animation
     show_export_video:   bool,
@@ -347,10 +374,10 @@ impl App {
 
         // Load default example if it exists, otherwise start with empty data
         let default_path = std::path::Path::new("examples/4_column_structure.ods.json");
-        let (datasets, channel_names, rows, edges, glyphs, meshes, current_file) = 
+        let (datasets, channel_names, rows, edges, glyphs, meshes, current_file, model_distance_unit) = 
             match ModelFile::load_from_file(default_path) {
-                Ok(mf) => (mf.datasets, mf.channel_names, mf.rows, mf.edges, mf.glyphs, mf.meshes, Some(default_path.to_path_buf())),
-                Err(_) => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), None),
+                Ok(mf) => (mf.datasets, mf.channel_names, mf.rows, mf.edges, mf.glyphs, mf.meshes, Some(default_path.to_path_buf()), Some(mf.distance_unit)),
+                Err(_) => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), None, None),
             };
 
         let prefs = UserPrefs::load();
@@ -363,7 +390,8 @@ impl App {
         cc.egui_ctx.set_visuals(visuals);
 
         let initial_dark_mode = prefs.dark_mode;
-        let initial_distance_unit = prefs.default_distance_unit.clone();
+        // Use the model's distance unit if available, otherwise the user's default.
+        let initial_distance_unit = model_distance_unit.unwrap_or_else(|| prefs.default_distance_unit.clone());
         let mut app = Self {
             datasets,
             channel_names,
@@ -416,9 +444,16 @@ impl App {
 
             interaction_tool:    InteractionTool::None,
             selection_filter:    SelectionFilter::Node,
+            edge_create_chain:     false,
+            edge_create_prev_node: None,
             fft_state:        FftPaneState::default(),
 
             show_wireframe:     false,
+
+            show_vectors:       false,
+            vector_vis_mode:    VectorVisMode::Velocity,
+            vector_scale:       1.0,
+            vector_use_contour: false,
 
             show_export_video:  false,
             export_video:       ExportVideoState::default(),
@@ -429,6 +464,7 @@ impl App {
             last_dark_mode:   initial_dark_mode,
 
             current_distance_unit: initial_distance_unit,
+            max_disp_mode: MaxDispMode::Local,
         };
         app.viewport.orthographic = app.prefs.default_orthographic;
         app.disp_scale = app.compute_auto_scale();
@@ -467,6 +503,87 @@ impl App {
             }
         }
         ((mx[0]-mn[0]).powi(2) + (mx[1]-mn[1]).powi(2) + (mx[2]-mn[2]).powi(2)).sqrt()
+    }
+
+    /// Centroid of all nodes with valid positions.
+    fn scene_center(&self) -> [f32; 3] {
+        let positions: Vec<[f32; 3]> = self.rows.iter().filter_map(row_position).collect();
+        if positions.is_empty() { return [0.0; 3]; }
+        let n = positions.len() as f32;
+        [
+            positions.iter().map(|p| p[0]).sum::<f32>() / n,
+            positions.iter().map(|p| p[1]).sum::<f32>() / n,
+            positions.iter().map(|p| p[2]).sum::<f32>() / n,
+        ]
+    }
+
+    /// Find the time step with maximum displacement.
+    /// `Local` = peak of any single node, `Average` = highest average across all nodes.
+    fn find_time_of_max_displacement(&self) -> f64 {
+        // Collect the time axis from the first dataset that has one.
+        let time_axis: &[f32] = match self.datasets.first() {
+            Some(ds) if !ds.time.is_empty() => &ds.time,
+            _ => return 0.0,
+        };
+
+        // Collect (channel_index, qualified_name) pairs for every axis assigned to a node.
+        let assigned: Vec<(usize, &str)> = self.rows.iter().flat_map(|row| {
+            [row.dx, row.dy, row.dz].into_iter().filter(|&idx| idx > 0)
+                .filter_map(|idx| self.channel_names.get(idx - 1).map(|n| (idx, n.as_str())))
+        }).collect();
+        if assigned.is_empty() { return 0.0; }
+
+        let mut best_t: f64 = 0.0;
+        let mut best_val: f64 = -1.0;
+        let n_nodes = self.rows.len().max(1) as f64;
+
+        for &t in time_axis {
+            let t64 = t as f64;
+            match self.max_disp_mode {
+                MaxDispMode::Local => {
+                    // Compute per-node magnitude, keep the max
+                    for row in &self.rows {
+                        let sample = |idx: usize| -> f32 {
+                            if idx == 0 { return 0.0; }
+                            match self.channel_names.get(idx - 1) {
+                                Some(qn) => sample_qualified(&self.datasets, qn, t64),
+                                None => 0.0,
+                            }
+                        };
+                        let dx = sample(row.dx);
+                        let dy = sample(row.dy);
+                        let dz = sample(row.dz);
+                        let mag = ((dx * dx + dy * dy + dz * dz) as f64).sqrt();
+                        if mag > best_val {
+                            best_val = mag;
+                            best_t = t64;
+                        }
+                    }
+                }
+                MaxDispMode::Average => {
+                    let mut sum: f64 = 0.0;
+                    for row in &self.rows {
+                        let sample = |idx: usize| -> f32 {
+                            if idx == 0 { return 0.0; }
+                            match self.channel_names.get(idx - 1) {
+                                Some(qn) => sample_qualified(&self.datasets, qn, t64),
+                                None => 0.0,
+                            }
+                        };
+                        let dx = sample(row.dx);
+                        let dy = sample(row.dy);
+                        let dz = sample(row.dz);
+                        sum += ((dx * dx + dy * dy + dz * dz) as f64).sqrt();
+                    }
+                    let avg = sum / n_nodes;
+                    if avg > best_val {
+                        best_val = avg;
+                        best_t = t64;
+                    }
+                }
+            }
+        }
+        best_t
     }
 
     /// Adjust the viewport camera so the entire model is visible.
@@ -530,9 +647,9 @@ impl App {
 
         // node_size is normalised (0..1 fraction of max), so it does NOT scale.
 
-        // Scale glyph sizes and offsets (both are in world units)
+        // Glyph sizes are unit-independent (like node_size) — do NOT scale.
+        // Only position offsets are in world units and need conversion.
         for g in &mut self.glyphs {
-            g.size *= f;
             for k in 0..3 { g.position_offset[k] *= f; }
         }
 
@@ -634,6 +751,7 @@ impl eframe::App for App {
                                     self.meshes        = mf.meshes;
                                     self.saved_views   = mf.saved_views;
                                     self.current_file  = Some(path);
+                                    self.current_distance_unit = mf.distance_unit;
                                     self.anim.time     = 0.0;
                                     self.anim.playing  = false;
                                     self.vis_mode      = self.prefs.default_vis_mode.clone();
@@ -654,15 +772,17 @@ impl eframe::App for App {
                     if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
                         if let Some(path) = &self.current_file.clone() {
                             let mf = ModelFile {
-                                datasets:      self.datasets.clone(),
+                                distance_unit: self.current_distance_unit.clone(),
+                                data_refs:     Vec::new(),
                                 channel_names: self.channel_names.clone(),
                                 rows:          self.rows.clone(),
                                 edges:         self.edges.clone(),
                                 glyphs:        self.glyphs.clone(),
                                 meshes:        self.meshes.clone(),
                                 saved_views:   self.saved_views.clone(),
+                                datasets:      Vec::new(),
                             };
-                            if let Err(e) = mf.save_to_file(path) {
+                            if let Err(e) = mf.save_to_file(path, &self.datasets, &self.current_distance_unit) {
                                 eprintln!("Failed to save: {e}");
                             }
                         }
@@ -676,15 +796,17 @@ impl eframe::App for App {
                             .save_file()
                         {
                             let mf = ModelFile {
-                                datasets:      self.datasets.clone(),
+                                distance_unit: self.current_distance_unit.clone(),
+                                data_refs:     Vec::new(),
                                 channel_names: self.channel_names.clone(),
                                 rows:          self.rows.clone(),
                                 edges:         self.edges.clone(),
                                 glyphs:        self.glyphs.clone(),
                                 meshes:        self.meshes.clone(),
                                 saved_views:   self.saved_views.clone(),
+                                datasets:      Vec::new(),
                             };
-                            if let Err(e) = mf.save_to_file(&path) {
+                            if let Err(e) = mf.save_to_file(&path, &self.datasets, &self.current_distance_unit) {
                                 eprintln!("Failed to save: {e}");
                             } else {
                                 self.current_file = Some(path);
@@ -703,11 +825,6 @@ impl eframe::App for App {
                         self.show_views = true;
                         ui.close_menu();
                     }
-                    if ui.button("Create Nodes…").clicked() {
-                        self.show_create_nodes = true;
-                        ui.close_menu();
-                    }
-                    ui.separator();
                     if ui.button("CSYS Builder…").clicked() {
                         self.csys_builder_target = CsysTarget::None;
                         self.csys_builder.load_from_matrix(crate::table::identity_mat3());
@@ -720,7 +837,7 @@ impl eframe::App for App {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Time Plot…").clicked() {
+                    if ui.button("Plot…").clicked() {
                         self.show_time_plot = true;
                         ui.close_menu();
                     }
@@ -861,6 +978,21 @@ impl eframe::App for App {
                         egui::DragValue::new(&mut self.anim.fps)
                             .range(1.0..=1000.0).speed(1.0)
                     );
+
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    // Jump to max displacement
+                    if ui.button(format!("{}  Max", egui_phosphor::regular::CROSSHAIR))
+                        .on_hover_text("Jump to frame of maximum displacement")
+                        .clicked()
+                    {
+                        self.anim.playing = false;
+                        self.anim.time = self.find_time_of_max_displacement();
+                    }
+                    ui.radio_value(&mut self.max_disp_mode, MaxDispMode::Local,   "Local");
+                    ui.radio_value(&mut self.max_disp_mode, MaxDispMode::Average, "Avg");
                 });
                 ui.add_space(4.0);
                 // ── Row 2: Scale, Vis, Wireframe ─────────────────────────
@@ -934,6 +1066,23 @@ impl eframe::App for App {
 
                     // Wireframe overlay
                     ui.checkbox(&mut self.show_wireframe, "Wireframe");
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // Vector vis
+                    ui.checkbox(&mut self.show_vectors, "Vectors");
+                    if self.show_vectors {
+                        ui.radio_value(&mut self.vector_vis_mode, VectorVisMode::Velocity,     "Velocity");
+                        ui.radio_value(&mut self.vector_vis_mode, VectorVisMode::Acceleration, "Accel");
+                        ui.label("Scale:");
+                        ui.add_sized([80.0, 18.0],
+                            egui::Slider::new(&mut self.vector_scale, 0.1_f32..=10.0)
+                                .logarithmic(true)
+                                .show_value(false));
+                        ui.checkbox(&mut self.vector_use_contour, "Contour");
+                    }
                 });
                 ui.add_space(2.0);
             });
@@ -946,7 +1095,7 @@ impl eframe::App for App {
                 .default_height(240.0)
                 .min_height(90.0)
                 .show_inside(ui, |ui| {
-                    show_top_pane(
+                    let (_changed, activate_create_edges, activate_create_nodes) = show_top_pane(
                         ui,
                         &mut self.active_tab,
                         &mut self.rows,
@@ -957,6 +1106,15 @@ impl eframe::App for App {
                         &mut self.clipboard,
                         self.current_distance_unit.label(),
                     );
+                    if activate_create_edges {
+                        self.interaction_tool = InteractionTool::CreateEdges;
+                        self.edge_create_prev_node = None;
+                        self.edge_create_chain = false;
+                    }
+                    if activate_create_nodes {
+                        self.show_create_nodes = true;
+                        self.create_nodes.offset_unit = self.current_distance_unit.clone();
+                    }
                 });
 
             // ── Viewport toolbar ─────────────────────────────────────────
@@ -1106,9 +1264,15 @@ impl eframe::App for App {
                 [c[0], c[1], c[2], 1.0]
             };
 
-            let mut edge_segments: Vec<([f32; 3], [f32; 3])> = Vec::new();
-            let mut edge_colors:   Vec<([f32; 4], [f32; 4])> = Vec::new();
-            let mut edge_orig_idx: Vec<usize> = Vec::new(); // maps edge_segments index -> self.edges index
+            // Precompute world-space sizes needed for per-edge thickness.
+            let pre_actual_node_size = self.node_size * self.bounding_diag()
+                * (self.prefs.max_node_size_pct / 100.0);
+            let pre_actual_edge_thickness = self.edge_thickness * pre_actual_node_size;
+
+            let mut edge_segments:    Vec<([f32; 3], [f32; 3])> = Vec::new();
+            let mut edge_colors:      Vec<([f32; 4], [f32; 4])> = Vec::new();
+            let mut edge_orig_idx:    Vec<usize> = Vec::new(); // maps edge_segments index -> self.edges index
+            let mut edge_thicknesses: Vec<f32> = Vec::new();
 
             for (ei, edge) in self.edges.iter().enumerate() {
                 if edge.from.is_empty() || edge.to.is_empty() { continue; }
@@ -1116,6 +1280,12 @@ impl eframe::App for App {
                 let Some(&b) = id_to_pos.get(edge.to.as_str()) else { continue };
                 edge_segments.push((a, b));
                 edge_orig_idx.push(ei);
+                // Per-edge thickness: the override is an absolute multiplier on the global node size,
+                // matching how the global edge_thickness works.
+                let thickness = edge.thickness_override
+                    .map(|t| t * pre_actual_node_size)
+                    .unwrap_or(pre_actual_edge_thickness);
+                edge_thicknesses.push(thickness);
 
                 // Determine color for this edge
                 if let Some(c) = edge.color_override {
@@ -1176,7 +1346,7 @@ impl eframe::App for App {
                 ui.add_space(4.0);
 
                 // Selection filter buttons (always visible when a tool is active)
-                if self.interaction_tool != InteractionTool::None {
+                if self.interaction_tool != InteractionTool::None && self.interaction_tool != InteractionTool::CreateEdges {
                     ui.label("Filter:");
                     for (filter, label) in [
                         (SelectionFilter::Node,  format!("{} Node", egui_phosphor::regular::HEXAGON)),
@@ -1187,6 +1357,27 @@ impl eframe::App for App {
                         if ui.add(egui::SelectableLabel::new(active, label)).clicked() {
                             self.selection_filter = filter;
                         }
+                    }
+                }
+
+                // Chain-mode toggle for Create Edges
+                let create_on = self.interaction_tool == InteractionTool::CreateEdges;
+                if create_on {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.edge_create_chain, "Chain");
+                    if let Some(prev) = self.edge_create_prev_node {
+                        let prev_id = self.rows.get(prev)
+                            .map(|r| r.id.as_str()).unwrap_or("?");
+                        ui.label(format!("From: {}", prev_id));
+                    } else {
+                        ui.label("Click a node to start");
+                    }
+                    let esc_pressed = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                    if ui.small_button("Esc").clicked() || esc_pressed {
+                        self.interaction_tool = InteractionTool::None;
+                        self.edge_create_prev_node = None;
                     }
                 }
 
@@ -1238,7 +1429,11 @@ impl eframe::App for App {
                     base[1] + g.position_offset[1],
                     base[2] + g.position_offset[2],
                 ];
-                (pos, g.shape.clone(), [g.color[0], g.color[1], g.color[2], 1.0], g.size, g.stretch, g.tube_ratio)
+                // Compute actual world-space glyph size from normalised fraction
+                // (same formula as node_size so it scales with the model)
+                let actual_glyph_size = g.size * self.bounding_diag()
+                    * (self.prefs.max_node_size_pct / 100.0) * 0.2;
+                (pos, g.shape.clone(), [g.color[0], g.color[1], g.color[2], 1.0], actual_glyph_size, g.stretch, g.tube_ratio)
             }).collect();
             let glyph_sel: Vec<bool> = self.glyphs.iter().map(|g| g.selected).collect();
 
@@ -1365,6 +1560,82 @@ impl eframe::App for App {
                 * (self.prefs.max_node_size_pct / 100.0);
             let actual_edge_thickness = self.edge_thickness * actual_node_size;
 
+            // ── Build vector arrows ────────────────────────────────────────
+            // Each entry: (world_pos, dir_normalised, color_rgba, world_length)
+            let arrows: Vec<([f32; 3], [f32; 3], [f32; 4], f32)> = if self.show_vectors {
+                let t = self.anim.time;
+                let bbox = self.bounding_diag().max(1e-6);
+
+                // First pass: compute per-node 3D vectors (in SI units) and colours.
+                let raw: Vec<Option<([f32; 3], [f32; 3], [f32; 4], f32)>> = self.rows.iter()
+                    .filter(|r| row_position(r).is_some())
+                    .zip(node_positions.iter())
+                    .zip(node_colors.iter())
+                    .map(|((row, pos), color)| {
+                        let sample = |ch_idx: usize| -> f32 {
+                            if ch_idx == 0 { return 0.0; }
+                            let qname = match self.channel_names.get(ch_idx - 1) {
+                                Some(n) => n,
+                                None => return 0.0,
+                            };
+                            match self.vector_vis_mode {
+                                VectorVisMode::Velocity =>
+                                    sample_velocity_qualified(&self.datasets, qname, t),
+                                VectorVisMode::Acceleration =>
+                                    sample_acceleration_qualified(&self.datasets, qname, t),
+                            }
+                        };
+                        let lx = sample(row.dx);
+                        let ly = sample(row.dy);
+                        let lz = sample(row.dz);
+
+                        // Transform local vector to world space via the node's CSYS.
+                        let m = row.local_csys;
+                        let wx = m[0][0]*lx + m[1][0]*ly + m[2][0]*lz;
+                        let wy = m[0][1]*lx + m[1][1]*ly + m[2][1]*lz;
+                        let wz = m[0][2]*lx + m[1][2]*ly + m[2][2]*lz;
+                        let mag = (wx*wx + wy*wy + wz*wz).sqrt();
+                        if mag < 1e-30 { return None; }
+
+                        let arrow_color = if self.vector_use_contour {
+                            *color
+                        } else {
+                            let c = self.prefs.arrow_color;
+                            [c[0], c[1], c[2], 1.0]
+                        };
+                        Some(([pos[0], pos[1], pos[2]], [wx/mag, wy/mag, wz/mag], arrow_color, mag))
+                    })
+                    .collect();
+
+                // Second pass: normalise lengths so the largest arrow is
+                // `vector_scale * 15%` of the bounding-box diagonal.
+                let max_mag = raw.iter()
+                    .filter_map(|e| e.as_ref().map(|r| r.3))
+                    .fold(0.0_f32, f32::max)
+                    .max(1e-30);
+                let ref_len = bbox * 0.15 * self.vector_scale;
+
+                raw.into_iter().flatten().map(|(pos, dir, color, mag)| {
+                    (pos, dir, color, (mag / max_mag) * ref_len)
+                }).collect()
+            } else {
+                Vec::new()
+            };
+
+            // ── Build label arrays for number overlays ─────────────────────
+            let node_labels: Vec<String> = self.rows.iter()
+                .filter(|r| row_position(r).is_some())
+                .map(|r| r.id.clone())
+                .collect();
+            let edge_labels: Vec<String> = edge_orig_idx.iter()
+                .map(|&i| self.edges[i].id.clone())
+                .collect();
+            let glyph_labels: Vec<String> = self.glyphs.iter().map(|g| g.id.clone()).collect();
+            let mesh_labels:  Vec<String> = self.meshes.iter().map(|m| m.id.clone()).collect();
+
+            let sc = self.scene_center();
+            let sr = (self.bounding_diag() * 0.5).max(1.0);
+
             // Remaining area: 3D viewport
             let vp_resp = show_viewport(
                 ui,
@@ -1381,6 +1652,7 @@ impl eframe::App for App {
                 self.prefs.local_csys_scale_pct / 100.0,
                 self.interaction_tool == InteractionTool::Select,
                 actual_edge_thickness,
+                &edge_thicknesses,
                 self.prefs.viewport_bg_color,
                 self.prefs.middle_button_orbit,
                 &glyph_data,
@@ -1389,11 +1661,23 @@ impl eframe::App for App {
                 &wireframe_edges,
                 self.current_distance_unit.label(),
                 &self.current_distance_unit,
+                if self.prefs.lighting_enabled { self.prefs.light_brightness } else { 0.0 },
+                self.prefs.lighting_enabled,
+                &node_labels,
+                &edge_labels,
+                &glyph_labels,
+                &mesh_labels,
+                arrows,
+                sc,
+                sr,
             );
 
             // ── Handle unit change from viewport context menu ─────────────
             if let Some(new_unit) = vp_resp.unit_change.clone() {
                 self.convert_units(&new_unit);
+            }
+            if let Some(enabled) = vp_resp.lighting_toggled {
+                self.prefs.lighting_enabled = enabled;
             }
 
             // ── Node picking / selection ──────────────────────────────────────
@@ -1478,6 +1762,12 @@ impl eframe::App for App {
                 // Remap from edge_segments index to self.edges index
                 best.and_then(|i| edge_orig_idx.get(i).copied())
             };
+            // ── Plot "Select Nodes" activation ────────────────────────
+            if self.time_plot.activate_select {
+                self.interaction_tool = InteractionTool::Select;
+                self.selection_filter = SelectionFilter::Node;
+                self.time_plot.activate_select = false;
+            }
 
             match self.interaction_tool {
                 InteractionTool::Details => {
@@ -1566,6 +1856,53 @@ impl eframe::App for App {
                         }
                     }
                 }
+                InteractionTool::CreateEdges => {
+                    if let Some(cpos) = vp_resp.clicked_pos {
+                        if let Some(pick_idx) = pick_nearest(cpos, 20.0) {
+                            // Map pick index back to row index (only rows with valid positions)
+                            let mut pi = 0usize;
+                            let mut row_idx = None;
+                            for (ri, r) in self.rows.iter().enumerate() {
+                                if row_position(r).is_none() { continue; }
+                                if pi == pick_idx { row_idx = Some(ri); break; }
+                                pi += 1;
+                            }
+                            if let Some(ri) = row_idx {
+                                if let Some(prev_ri) = self.edge_create_prev_node {
+                                    // Create the edge between prev and current
+                                    if prev_ri != ri {
+                                        let from_id = self.rows[prev_ri].id.clone();
+                                        let to_id   = self.rows[ri].id.clone();
+                                        // Avoid duplicate edges
+                                        let exists = self.edges.iter().any(|e| {
+                                            (e.from == from_id && e.to == to_id)
+                                            || (e.from == to_id && e.to == from_id)
+                                        });
+                                        if !exists {
+                                            let id = crate::table::next_edge_id(&self.edges);
+                                            self.edges.push(crate::table::Edge {
+                                                id,
+                                                from: from_id,
+                                                to:   to_id,
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                    // In chain mode: this node becomes the new start.
+                                    // In pair mode: reset so next pair starts fresh.
+                                    self.edge_create_prev_node = if self.edge_create_chain {
+                                        Some(ri)
+                                    } else {
+                                        None
+                                    };
+                                } else {
+                                    // First node selected
+                                    self.edge_create_prev_node = Some(ri);
+                                }
+                            }
+                        }
+                    }
+                }
                 InteractionTool::None => {
                     // No picking in orbit-only mode
                 }
@@ -1580,6 +1917,7 @@ impl eframe::App for App {
             if ni < self.rows.len() {
                 let mut open = true;
                 egui::Window::new(format!("Node: {}", self.rows[ni].id))
+                    .id(egui::Id::new(("node_details_win", ni)))
                     .open(&mut open)
                     .default_width(310.0)
                     .resizable(false)
@@ -1715,6 +2053,7 @@ impl eframe::App for App {
                     format!("Glyph: {}", self.glyphs[gi].id)
                 };
                 egui::Window::new(title)
+                    .id(egui::Id::new(("glyph_details_win", gi)))
                     .open(&mut open)
                     .default_width(310.0)
                     .resizable(false)
@@ -1818,7 +2157,16 @@ impl eframe::App for App {
         if let Some(ei) = self.selected_edge {
             if ei < self.edges.len() {
                 let mut open = true;
-                egui::Window::new(format!("Edge #{}", ei + 1))
+                let edge_title = if self.edges[ei].id.is_empty() {
+                    format!("Edge #{}", ei + 1)
+                } else {
+                    format!("Edge: {}", self.edges[ei].id)
+                };
+                let node_labels: Vec<String> = self.rows.iter().enumerate().map(|(i, r)| {
+                    if r.id.trim().is_empty() { format!("node {}", i + 1) } else { r.id.clone() }
+                }).collect();
+                egui::Window::new(edge_title)
+                    .id(egui::Id::new(("edge_details_win", ei)))
                     .open(&mut open)
                     .default_width(310.0)
                     .resizable(false)
@@ -1830,12 +2178,28 @@ impl eframe::App for App {
                             .show(ui, |ui| {
                                 let e = &mut self.edges[ei];
 
+                                ui.label("ID:");
+                                ui.add(egui::TextEdit::singleline(&mut e.id).desired_width(150.0));
+                                ui.end_row();
+
                                 ui.label("From Node:");
-                                ui.add(egui::TextEdit::singleline(&mut e.from).desired_width(100.0));
+                                crate::table::node_id_dropdown(
+                                    ui,
+                                    egui::Id::new(("edge_detail_from", ei)),
+                                    &mut e.from,
+                                    &node_labels,
+                                    &self.rows,
+                                );
                                 ui.end_row();
 
                                 ui.label("To Node:");
-                                ui.add(egui::TextEdit::singleline(&mut e.to).desired_width(100.0));
+                                crate::table::node_id_dropdown(
+                                    ui,
+                                    egui::Id::new(("edge_detail_to", ei)),
+                                    &mut e.to,
+                                    &node_labels,
+                                    &self.rows,
+                                );
                                 ui.end_row();
 
                                 // Color override
@@ -1938,6 +2302,7 @@ impl eframe::App for App {
             &mut self.time_plot,
             &self.datasets,
             &self.channel_names,
+            &self.rows,
             self.anim.time,
         );
 
@@ -1962,6 +2327,7 @@ impl eframe::App for App {
             &mut self.create_nodes,
             &self.rows,
             &self.csys_manager,
+            &self.current_distance_unit,
         ) {
             self.rows.extend(new_rows);
         }

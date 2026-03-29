@@ -106,6 +106,7 @@ pub fn import_edges_csv(edges: &mut Vec<Edge>) -> bool {
         Ok(h) => h.clone(),
         Err(_) => return false,
     };
+    let ci_id   = headers.iter().position(|h| h.eq_ignore_ascii_case("id"));
     let ci_from = headers.iter().position(|h| h.eq_ignore_ascii_case("from"));
     let ci_to   = headers.iter().position(|h| h.eq_ignore_ascii_case("to"));
 
@@ -113,6 +114,7 @@ pub fn import_edges_csv(edges: &mut Vec<Edge>) -> bool {
     for result in rdr.records() {
         let Ok(rec) = result else { continue; };
         new_edges.push(Edge {
+            id:   ci_id  .and_then(|i| rec.get(i)).unwrap_or("").to_string(),
             from: ci_from.and_then(|i| rec.get(i)).unwrap_or("").to_string(),
             to:   ci_to  .and_then(|i| rec.get(i)).unwrap_or("").to_string(),
             color_override: None,
@@ -134,9 +136,9 @@ pub fn export_edges_csv(edges: &[Edge]) {
     else { return; };
 
     let Ok(mut wtr) = csv::Writer::from_path(&path) else { return; };
-    let _ = wtr.write_record(&["from", "to"]);
+    let _ = wtr.write_record(&["id", "from", "to"]);
     for edge in edges {
-        let _ = wtr.write_record(&[&edge.from, &edge.to]);
+        let _ = wtr.write_record(&[&edge.id, &edge.from, &edge.to]);
     }
     let _ = wtr.flush();
 }
@@ -227,9 +229,23 @@ fn is_identity_mat3(m: &[[f32; 3]; 3]) -> bool {
 
 fn default_white() -> [f32; 3] { [1.0, 1.0, 1.0] }
 
+/// Generate a unique edge ID of the form `E<N>` that does not already exist in `edges`.
+/// N is max(existing E<N> suffixes) + 1, falling back to `edges.len() + 1`.
+pub fn next_edge_id(edges: &[Edge]) -> String {
+    let max_n = edges.iter()
+        .filter_map(|e| e.id.strip_prefix('E').and_then(|s| s.parse::<usize>().ok()))
+        .max()
+        .unwrap_or(0);
+    let n = max_n.max(edges.len()) + 1;
+    format!("E{}", n)
+}
+
 /// An edge connecting two nodes by their IDs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Edge {
+    /// User-defined edge identifier.
+    #[serde(default)]
+    pub id: String,
     /// The node ID of the "from" end.
     pub from: String,
     /// The node ID of the "to" end.
@@ -359,8 +375,10 @@ pub fn show_top_pane(
     channel_names: &[String],
     clipboard: &mut Option<Row>,
     unit_label: &str,
-) -> bool {
+) -> (bool, bool, bool) {
     let mut changed = false;
+    let mut activate_create_edges = false;
+    let mut activate_create_nodes = false;
 
     // ── Outer frame gives the inset look ──────────────────────────────────────
     let v = ui.visuals();
@@ -372,10 +390,14 @@ pub fn show_top_pane(
         .show(ui, |ui| {
             // ── Tab bar ───────────────────────────────────────────────────────
             ui.horizontal(|ui| {
-                tab_button(ui, active_tab, TableTab::Nodes,  &format!("{} Nodes", egui_phosphor::regular::HEXAGON));
-                tab_button(ui, active_tab, TableTab::Edges,  &format!("{} Edges", egui_phosphor::regular::LINE_SEGMENTS));
-                tab_button(ui, active_tab, TableTab::Glyphs, &format!("{} Glyphs", egui_phosphor::regular::DIAMOND));
-                tab_button(ui, active_tab, TableTab::Meshes, &format!("{} Meshes", egui_phosphor::regular::POLYGON));
+                tab_button(ui, active_tab, TableTab::Nodes,  &format!("{} Nodes",  egui_phosphor::regular::HEXAGON),
+                    "Nodes are points in 3D space.\nDefine each node with an ID and X / Y / Z coordinates.\nAssign displacement or rotation channels to animate them.");
+                tab_button(ui, active_tab, TableTab::Edges,  &format!("{} Edges",  egui_phosphor::regular::LINE_SEGMENTS),
+                    "Edges are straight line segments connecting two nodes.\nDefine each edge with an ID and a From / To node.\nEdge colour and thickness can be overridden per edge.");
+                tab_button(ui, active_tab, TableTab::Glyphs, &format!("{} Glyphs", egui_phosphor::regular::DIAMOND),
+                    "Glyphs are 3D shapes (sphere, cube, cylinder, torus) attached to one or more nodes.\nTheir position is the average of the assigned nodes plus an optional offset.\nSize, stretch, and colour are all configurable.");
+                tab_button(ui, active_tab, TableTab::Meshes, &format!("{} Meshes", egui_phosphor::regular::POLYGON),
+                    "Meshes are triangulated surface patches spanning a set of nodes.\nAssign three or more nodes and modus computes a Delaunay triangulation.\nColour and opacity are configurable.");
 
                 // Right-aligned buttons: Add | Export | Import
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -384,6 +406,9 @@ pub fn show_top_pane(
                             if ui.button(format!("{} Add Node", egui_phosphor::regular::PLUS)).clicked() {
                                 rows.push(Row::default());
                                 changed = true;
+                            }
+                            if ui.button(format!("{} Create Nodes", egui_phosphor::regular::MAGIC_WAND)).clicked() {
+                                activate_create_nodes = true;
                             }
                             ui.add_space(4.0);
                             if ui.button(format!("{} Export CSV", egui_phosphor::regular::EXPORT)).clicked() {
@@ -398,8 +423,12 @@ pub fn show_top_pane(
                         }
                         TableTab::Edges => {
                             if ui.button(format!("{} Add Edge", egui_phosphor::regular::PLUS)).clicked() {
-                                edges.push(Edge::default());
+                                let id = next_edge_id(edges);
+                                edges.push(Edge { id, ..Default::default() });
                                 changed = true;
+                            }
+                            if ui.button(format!("{} Create Edges", egui_phosphor::regular::LINE_SEGMENTS)).clicked() {
+                                activate_create_edges = true;
                             }
                             ui.add_space(4.0);
                             if ui.button(format!("{} Export CSV", egui_phosphor::regular::EXPORT)).clicked() {
@@ -460,18 +489,18 @@ pub fn show_top_pane(
                 });
         });
 
-    changed
+    (changed, activate_create_edges, activate_create_nodes)
 }
 
 /// Styled toggle button for the tab bar.
-fn tab_button(ui: &mut egui::Ui, active: &mut TableTab, variant: TableTab, label: &str) {
+fn tab_button(ui: &mut egui::Ui, active: &mut TableTab, variant: TableTab, label: &str, tooltip: &str) {
     let selected = *active == variant;
     let resp = ui.add(
         egui::Button::new(label)
             .selected(selected)
             .corner_radius(egui::CornerRadius::same(4)),
     );
-    if resp.clicked() {
+    if resp.on_hover_text(tooltip).clicked() {
         *active = variant;
     }
 }
@@ -618,8 +647,6 @@ fn show_edge_table(
 
     let text_h = ui.text_style_height(&egui::TextStyle::Body);
     let row_h = text_h + 10.0;
-    let avail = ui.available_width();
-    let dd_w = ((avail - 36.0 - 36.0) / 2.0).max(120.0);
 
     if rows.is_empty() {
         ui.centered_and_justified(|ui| {
@@ -636,13 +663,14 @@ fn show_edge_table(
         .striped(true)
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::initial(36.0).at_least(28.0))        // #
-        .column(Column::initial(dd_w).at_least(120.0))       // From
-        .column(Column::initial(dd_w).at_least(120.0))       // To
-        .column(Column::initial(36.0).at_least(32.0))        // Delete
+        .column(Column::initial(32.0).at_least(28.0))        // #
+        .column(Column::initial(80.0).at_least(60.0))        // ID
+        .column(Column::initial(120.0).at_least(80.0))       // From
+        .column(Column::initial(120.0).at_least(80.0))       // To
+        .column(Column::initial(32.0).at_least(28.0))        // Delete
         .min_scrolled_height(0.0)
         .header(row_h, |mut header| {
-            for label in ["#", "From", "To", ""] {
+            for label in ["#", "ID", "From", "To", ""] {
                 header.col(|ui| { ui.strong(label); });
             }
         })
@@ -653,6 +681,16 @@ fn show_edge_table(
                     // Row number
                     row_ui.col(|ui| {
                         ui.label(format!("{}", i + 1));
+                    });
+
+                    // Edge ID
+                    row_ui.col(|ui| {
+                        if ui.add(
+                            egui::TextEdit::singleline(&mut edges[i].id)
+                                .desired_width(ui.available_width()),
+                        ).changed() {
+                            changed = true;
+                        }
                     });
 
                     // From node dropdown
@@ -986,7 +1024,7 @@ fn show_mesh_table(
 }
 
 /// ComboBox that selects a node by displaying its label; stores the node's `id` string.
-fn node_id_dropdown(
+pub fn node_id_dropdown(
     ui: &mut egui::Ui,
     id: egui::Id,
     value: &mut String,
