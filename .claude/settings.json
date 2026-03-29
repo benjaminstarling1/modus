@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /c/Users/benja/.gemini/antigravity/scratch/modus/src/*.rs)",
+      "Bash(wc -l /c/Users/benja/.gemini/antigravity/scratch/modus/.claude/worktrees/agent-a48a0eab/src/*.rs)",
+      "Bash(sed -n '1,90p' /c/Users/benja/.gemini/antigravity/scratch/modus/.claude/worktrees/agent-a48a0eab/src/viewport.rs)",
+      "Bash(sed -n '905,1585p' /c/Users/benja/.gemini/antigravity/scratch/modus/.claude/worktrees/agent-a48a0eab/src/viewport.rs)",
+      "Read(//tmp/**)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ],
+    "additionalDirectories": [
+      "\\tmp"
+    ]
+  }
+}

@@ -99,12 +99,6 @@ pub fn identity_mat3() -> [[f32; 3]; 3] {
 
 pub fn default_true() -> bool { true }
 
-pub fn is_identity_mat3(m: &[[f32; 3]; 3]) -> bool {
-    let id = identity_mat3();
-    (m[0][0] - id[0][0]).abs() < 1e-6 && (m[0][1] - id[0][1]).abs() < 1e-6 && (m[0][2] - id[0][2]).abs() < 1e-6 &&
-    (m[1][0] - id[1][0]).abs() < 1e-6 && (m[1][1] - id[1][1]).abs() < 1e-6 && (m[1][2] - id[1][2]).abs() < 1e-6 &&
-    (m[2][0] - id[2][0]).abs() < 1e-6 && (m[2][1] - id[2][1]).abs() < 1e-6 && (m[2][2] - id[2][2]).abs() < 1e-6
-}
 
 fn default_white() -> [f32; 3] { [1.0, 1.0, 1.0] }
 
