@@ -1,11 +1,12 @@
-use crate::data::{max_duration, sample_qualified, sample_velocity_qualified, sample_acceleration_qualified, show_import_panel, Dataset};
+use crate::data::{max_duration, sample_by_channel_path, sample_velocity_by_channel_path, sample_acceleration_by_channel_path, show_import_panel, Dataset, Unit};
 use crate::table::{row_position, show_top_pane, Edge, Row, Glyph, GlyphShape, Mesh, TableTab, identity_mat3};
 use crate::viewport::{show_viewport, MeshRenderData, Viewport3D};
-use crate::persist::{UserPrefs, ModelFile, SavedView, DistanceUnit, show_options_window, show_views_window};
-use crate::csys_builder::{
-    CsysBuilder, CsysManager, show_csys_builder_window, show_csys_manager_panel,
+use crate::persist::{UserPrefs, ModelFile, SavedView, show_options_window, show_views_window};
+pub use crate::palette::Palette;
+use crate::coord_sys_builder::{
+    CoordSysBuilder, CoordSysManager, show_coord_sys_builder_window, show_coord_sys_manager_panel,
 };
-use crate::fft::{FftPaneState, AnimMode, FilterMode, show_fft_panel, sample_freq_based, sample_filtered};
+use crate::fft::{FftPaneState, AnimationMode, FilterMode, show_fft_panel, sample_freq_based, sample_filtered};
 use crate::time_plot::{TimePlotState, show_time_plot_window};
 use crate::create_nodes::{CreateNodesState, show_create_nodes_window};
 use crate::export_video::{
@@ -138,7 +139,7 @@ pub enum VectorVisMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-pub enum VisMode {
+pub enum VisualizationMode {
     #[default]
     None,
     ContourColor,
@@ -147,101 +148,17 @@ pub enum VisMode {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Colour palettes
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-pub enum Palette {
-    #[default]
-    Viridis,
-    Plasma,
-    Cool,
-    Hot,
-    Turbo,
-}
-
-impl Palette {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Palette::Viridis => "Viridis",
-            Palette::Plasma  => "Plasma",
-            Palette::Cool    => "Cool",
-            Palette::Hot     => "Hot",
-            Palette::Turbo   => "Turbo",
-        }
-    }
-
-    /// Map a value in [0, 1] to an RGBA colour.
-    /// If `reverse` is true the palette direction is flipped.
-    pub fn sample(&self, t: f32, reverse: bool) -> [f32; 4] {
-        let t = if reverse { 1.0 - t.clamp(0.0, 1.0) } else { t.clamp(0.0, 1.0) };
-        let stops: &[[f32; 3]] = match self {
-            Palette::Viridis => &[
-                [0.267, 0.005, 0.329],
-                [0.128, 0.567, 0.551],
-                [0.204, 0.788, 0.467],
-                [0.769, 0.882, 0.216],
-                [0.993, 0.906, 0.144],
-            ],
-            Palette::Plasma => &[
-                [0.050, 0.030, 0.528],
-                [0.558, 0.056, 0.654],
-                [0.899, 0.219, 0.458],
-                [0.980, 0.565, 0.163],
-                [0.940, 0.975, 0.131],
-            ],
-            Palette::Cool => &[
-                [0.0,  1.0, 1.0],
-                [0.25, 0.75, 1.0],
-                [0.5,  0.5, 1.0],
-                [0.75, 0.25, 1.0],
-                [1.0,  0.0, 1.0],
-            ],
-            Palette::Hot => &[
-                [0.04, 0.0, 0.0],
-                [0.6,  0.0, 0.0],
-                [1.0,  0.4, 0.0],
-                [1.0,  1.0, 0.0],
-                [1.0,  1.0, 1.0],
-            ],
-            Palette::Turbo => &[
-                [0.190, 0.072, 0.232],
-                [0.065, 0.365, 0.860],
-                [0.120, 0.724, 0.830],
-                [0.450, 0.978, 0.347],
-                [0.890, 0.860, 0.140],
-                [0.976, 0.533, 0.084],
-                [0.761, 0.028, 0.051],
-            ],
-        };
-
-        let n    = stops.len() - 1;
-        let idx  = (t * n as f32).floor() as usize;
-        let idx  = idx.min(n - 1);
-        let frac = t * n as f32 - idx as f32;
-        let a    = stops[idx];
-        let b    = stops[idx + 1];
-        [
-            a[0] + (b[0] - a[0]) * frac,
-            a[1] + (b[1] - a[1]) * frac,
-            a[2] + (b[2] - a[2]) * frac,
-            1.0,
-        ]
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // App
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum CsysTarget {
+pub enum CoordSysTarget {
     None,
     Node(usize),
     Manager(String),
 }
 
-impl Default for CsysTarget {
+impl Default for CoordSysTarget {
     fn default() -> Self { Self::None }
 }
 
@@ -257,12 +174,12 @@ pub struct App {
     viewport:      Viewport3D,
 
     // Animation & visualisation
-    anim:          AnimState,
-    vis_mode:      VisMode,
+    animation:     AnimState,
+    visualization_mode: VisualizationMode,
     palette:       Palette,
     reverse_pal:   bool,
     node_size:     f32,
-    disp_scale:    f32,
+    displacement_scale:    f32,
     auto_scale:    bool,
     size_vis_scale: f32,  // max node size multiplier for Size vis mode
     global_node_color: [f32; 3],
@@ -275,27 +192,27 @@ pub struct App {
     max_disp_mode:     MaxDispMode,
 
     // Persistence
-    prefs:            UserPrefs,
+    preferences:      UserPrefs,
     show_options:     bool,
     show_views:       bool,
     saved_views:      Vec<SavedView>,
     current_file:     Option<std::path::PathBuf>,
 
-    // CSYS Builder
-    csys_builder:        CsysBuilder,
-    show_csys_builder:   bool,
+    // Coord Sys Builder
+    coord_sys_builder:        CoordSysBuilder,
+    show_coord_sys_builder:   bool,
     /// Which target is being edited. None = standalone/global.
-    csys_builder_target: CsysTarget,
-    /// Written by show_csys_builder_window when Apply is clicked.
-    csys_apply_result:   Option<([[f32; 3]; 3], [[f32; 3]; 3], Vec<crate::csys_builder::CsysOp>)>,
-    /// Written by show_csys_builder_window when Save to Manager is clicked.
-    csys_save_mgr_result: Option<(String, [[f32; 3]; 3], [[f32; 3]; 3], Vec<crate::csys_builder::CsysOp>)>,
+    coord_sys_builder_target: CoordSysTarget,
+    /// Written by show_coord_sys_builder_window when Apply is clicked.
+    coord_sys_apply_result:   Option<([[f32; 3]; 3], [[f32; 3]; 3], Vec<crate::coord_sys_builder::CoordSysOp>)>,
+    /// Written by show_coord_sys_builder_window when Save to Manager is clicked.
+    coord_sys_save_mgr_result: Option<(String, [[f32; 3]; 3], [[f32; 3]; 3], Vec<crate::coord_sys_builder::CoordSysOp>)>,
 
-    // CSYS Manager
-    csys_manager:     CsysManager,
+    // Coord Sys Manager
+    coord_sys_manager:     CoordSysManager,
     /// Pending matrix to apply to all selected nodes from the manager.
-    csys_mgr_apply:   Option<([[f32; 3]; 3], [[f32; 3]; 3], Vec<crate::csys_builder::CsysOp>)>,
-    csys_mgr_edit:    Option<(String, [[f32; 3]; 3], Vec<crate::csys_builder::CsysOp>)>,
+    coord_sys_manager_apply:   Option<([[f32; 3]; 3], [[f32; 3]; 3], Vec<crate::coord_sys_builder::CoordSysOp>)>,
+    coord_sys_manager_edit:    Option<(String, [[f32; 3]; 3], Vec<crate::coord_sys_builder::CoordSysOp>)>,
 
     // Create Nodes dialog
     show_create_nodes:   bool,
@@ -332,7 +249,7 @@ pub struct App {
     last_dark_mode: bool,
 
     // Current model distance unit (per-session, not persisted)
-    current_distance_unit: DistanceUnit,
+    current_distance_unit: Unit,
 }
 
 impl App {
@@ -403,16 +320,16 @@ impl App {
             active_tab:    TableTab::default(),
             viewport:      Viewport3D::default(),
 
-            anim:          AnimState {
+            animation:     AnimState {
                 speed: prefs.default_speed,
                 fps:   prefs.default_fps,
                 ..Default::default()
             },
-            vis_mode:      prefs.default_vis_mode.clone(),
+            visualization_mode: prefs.default_vis_mode.clone(),
             palette:       prefs.default_palette.clone(),
             reverse_pal:   prefs.default_reverse_pal,
             node_size:     prefs.default_node_size,
-            disp_scale:    1.0,
+            displacement_scale:    1.0,
             auto_scale:    prefs.default_auto_scale,
             size_vis_scale: 3.0,
             global_node_color: prefs.default_node_color,
@@ -423,21 +340,21 @@ impl App {
             selected_glyph:    None,
             selected_edge:     None,
 
-            prefs,
+            preferences: prefs,
             show_options:  false,
             show_views:    false,
             saved_views:   Vec::new(),
             current_file,
 
-            csys_builder:         CsysBuilder::default(),
-            show_csys_builder:    false,
-            csys_builder_target:  CsysTarget::None,
-            csys_apply_result:    None,
-            csys_save_mgr_result: None,
+            coord_sys_builder:         CoordSysBuilder::default(),
+            show_coord_sys_builder:    false,
+            coord_sys_builder_target:  CoordSysTarget::None,
+            coord_sys_apply_result:    None,
+            coord_sys_save_mgr_result: None,
 
-            csys_manager:     CsysManager::default(),
-            csys_mgr_apply:   None,
-            csys_mgr_edit:    None,
+            coord_sys_manager:         CoordSysManager::default(),
+            coord_sys_manager_apply:   None,
+            coord_sys_manager_edit:    None,
 
             show_create_nodes:  false,
             create_nodes:       CreateNodesState::default(),
@@ -466,8 +383,8 @@ impl App {
             current_distance_unit: initial_distance_unit,
             max_disp_mode: MaxDispMode::Local,
         };
-        app.viewport.orthographic = app.prefs.default_orthographic;
-        app.disp_scale = app.compute_auto_scale();
+        app.viewport.orthographic = app.preferences.default_orthographic;
+        app.displacement_scale = app.compute_auto_scale();
         app.fit_to_model();
         app
     }
@@ -528,7 +445,7 @@ impl App {
 
         // Collect (channel_index, qualified_name) pairs for every axis assigned to a node.
         let assigned: Vec<(usize, &str)> = self.rows.iter().flat_map(|row| {
-            [row.dx, row.dy, row.dz].into_iter().filter(|&idx| idx > 0)
+            [row.channel_dx, row.channel_dy, row.channel_dz].into_iter().filter(|&idx| idx > 0)
                 .filter_map(|idx| self.channel_names.get(idx - 1).map(|n| (idx, n.as_str())))
         }).collect();
         if assigned.is_empty() { return 0.0; }
@@ -546,13 +463,13 @@ impl App {
                         let sample = |idx: usize| -> f32 {
                             if idx == 0 { return 0.0; }
                             match self.channel_names.get(idx - 1) {
-                                Some(qn) => sample_qualified(&self.datasets, qn, t64),
+                                Some(qn) => sample_by_channel_path(&self.datasets, qn, t64),
                                 None => 0.0,
                             }
                         };
-                        let dx = sample(row.dx);
-                        let dy = sample(row.dy);
-                        let dz = sample(row.dz);
+                        let dx = sample(row.channel_dx);
+                        let dy = sample(row.channel_dy);
+                        let dz = sample(row.channel_dz);
                         let mag = ((dx * dx + dy * dy + dz * dz) as f64).sqrt();
                         if mag > best_val {
                             best_val = mag;
@@ -566,13 +483,13 @@ impl App {
                         let sample = |idx: usize| -> f32 {
                             if idx == 0 { return 0.0; }
                             match self.channel_names.get(idx - 1) {
-                                Some(qn) => sample_qualified(&self.datasets, qn, t64),
+                                Some(qn) => sample_by_channel_path(&self.datasets, qn, t64),
                                 None => 0.0,
                             }
                         };
-                        let dx = sample(row.dx);
-                        let dy = sample(row.dy);
-                        let dz = sample(row.dz);
+                        let dx = sample(row.channel_dx);
+                        let dy = sample(row.channel_dy);
+                        let dz = sample(row.channel_dz);
                         sum += ((dx * dx + dy * dy + dz * dz) as f64).sqrt();
                     }
                     let avg = sum / n_nodes;
@@ -626,14 +543,14 @@ impl App {
     }
 
     /// Convert all world-space values when switching distance unit.
-    fn convert_units(&mut self, new_unit: &DistanceUnit) {
+    fn convert_units(&mut self, new_unit: &Unit) {
         let f = self.current_distance_unit.convert_factor(new_unit) as f32;
         if (f - 1.0).abs() < 1e-9 { return; }
 
         // Scale node positions (stored as strings)
         let factor = self.current_distance_unit.convert_factor(new_unit);
         for row in &mut self.rows {
-            for coord in [&mut row.x, &mut row.y, &mut row.z] {
+            for coord in [&mut row.x_str, &mut row.y_str, &mut row.z_str] {
                 if let Ok(v) = coord.parse::<f64>() {
                     let new_v = v * factor;
                     *coord = format_coord(new_v);
@@ -653,7 +570,7 @@ impl App {
             for k in 0..3 { g.position_offset[k] *= f; }
         }
 
-        // disp_scale is unit-independent — si_to_model handles the
+        // displacement_scale is unit-independent — si_to_model handles the
         // conversion at the render site, so no scaling is needed here.
 
         self.current_distance_unit = new_unit.clone();
@@ -686,7 +603,7 @@ impl App {
         use crate::data::channel_max_displacement;
         let mut max_d = 0.0_f32;
         for row in &self.rows {
-            for idx in [row.dx, row.dy, row.dz] {
+            for idx in [row.channel_dx, row.channel_dy, row.channel_dz] {
                 if idx == 0 { continue; }
                 if let Some(ch) = self.channel_names.get(idx - 1) {
                     max_d = max_d.max(channel_max_displacement(&self.datasets, ch));
@@ -701,15 +618,15 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── Advance playback clock ────────────────────────────────────────
         let duration = max_duration(&self.datasets, &self.channel_names, &self.rows);
-        self.anim.tick(duration);
-        if self.anim.playing {
+        self.animation.tick(duration);
+        if self.animation.playing {
             ctx.request_repaint();
         }
 
         // ── Apply theme (only when changed) ──────────────────────────────
-        if self.prefs.dark_mode != self.last_dark_mode {
-            self.last_dark_mode = self.prefs.dark_mode;
-            ctx.set_visuals(Self::build_visuals(self.prefs.dark_mode));
+        if self.preferences.dark_mode != self.last_dark_mode {
+            self.last_dark_mode = self.preferences.dark_mode;
+            ctx.set_visuals(Self::build_visuals(self.preferences.dark_mode));
         }
 
         // ── Menu bar ──────────────────────────────────────────────────────
@@ -725,14 +642,14 @@ impl eframe::App for App {
                         self.meshes.clear();
                         self.saved_views.clear();
                         self.current_file  = None;
-                        self.anim.time     = 0.0;
-                        self.anim.playing  = false;
-                        self.vis_mode      = self.prefs.default_vis_mode.clone();
-                        self.palette       = self.prefs.default_palette.clone();
-                        self.reverse_pal   = self.prefs.default_reverse_pal;
-                        self.node_size     = self.prefs.default_node_size;
-                        self.auto_scale    = self.prefs.default_auto_scale;
-                        self.disp_scale    = 1.0;
+                        self.animation.time     = 0.0;
+                        self.animation.playing  = false;
+                        self.visualization_mode      = self.preferences.default_vis_mode.clone();
+                        self.palette       = self.preferences.default_palette.clone();
+                        self.reverse_pal   = self.preferences.default_reverse_pal;
+                        self.node_size     = self.preferences.default_node_size;
+                        self.auto_scale    = self.preferences.default_auto_scale;
+                        self.displacement_scale    = 1.0;
                         ui.close_menu();
                     }
                     if ui.button("Open...").clicked() {
@@ -752,14 +669,14 @@ impl eframe::App for App {
                                     self.saved_views   = mf.saved_views;
                                     self.current_file  = Some(path);
                                     self.current_distance_unit = mf.distance_unit;
-                                    self.anim.time     = 0.0;
-                                    self.anim.playing  = false;
-                                    self.vis_mode      = self.prefs.default_vis_mode.clone();
-                                    self.palette       = self.prefs.default_palette.clone();
-                                    self.reverse_pal   = self.prefs.default_reverse_pal;
-                                    self.node_size     = self.prefs.default_node_size;
-                                    self.auto_scale    = self.prefs.default_auto_scale;
-                                    self.disp_scale    = self.compute_auto_scale();
+                                    self.animation.time     = 0.0;
+                                    self.animation.playing  = false;
+                                    self.visualization_mode      = self.preferences.default_vis_mode.clone();
+                                    self.palette       = self.preferences.default_palette.clone();
+                                    self.reverse_pal   = self.preferences.default_reverse_pal;
+                                    self.node_size     = self.preferences.default_node_size;
+                                    self.auto_scale    = self.preferences.default_auto_scale;
+                                    self.displacement_scale    = self.compute_auto_scale();
                                     self.fit_to_model();
                                 }
                                 Err(e) => eprintln!("Failed to open model: {e}"),
@@ -826,13 +743,13 @@ impl eframe::App for App {
                         ui.close_menu();
                     }
                     if ui.button("CSYS Builder…").clicked() {
-                        self.csys_builder_target = CsysTarget::None;
-                        self.csys_builder.load_from_matrix(crate::table::identity_mat3());
-                        self.show_csys_builder = true;
+                        self.coord_sys_builder_target = CoordSysTarget::None;
+                        self.coord_sys_builder.load_from_matrix(crate::table::identity_mat3());
+                        self.show_coord_sys_builder = true;
                         ui.close_menu();
                     }
                     if ui.button("Export Animation…").clicked() {
-                        self.export_video.fps = self.anim.fps;
+                        self.export_video.fps = self.animation.fps;
                         self.show_export_video = true;
                         ui.close_menu();
                     }
@@ -864,12 +781,12 @@ impl eframe::App for App {
                         egui::ScrollArea::vertical().id_salt("csys_mgr_scroll").show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 4.0;
                             let sel_count = self.rows.iter().filter(|r| r.selected).count();
-                            show_csys_manager_panel(
+                            show_coord_sys_manager_panel(
                                 ui,
-                                &mut self.csys_manager,
+                                &mut self.coord_sys_manager,
                                 sel_count,
-                                &mut self.csys_mgr_apply,
-                                &mut self.csys_mgr_edit,
+                                &mut self.coord_sys_manager_apply,
+                                &mut self.coord_sys_manager_edit,
                             );
                         });
                     });
@@ -914,59 +831,59 @@ impl eframe::App for App {
                         .on_hover_text("Step back one frame")
                         .clicked()
                     {
-                        self.anim.playing = false;
-                        self.anim.step_back(duration);
+                        self.animation.playing = false;
+                        self.animation.step_back(duration);
                     }
                     // Play / Pause
-                    let icon = if self.anim.playing { egui_phosphor::regular::PAUSE } else { egui_phosphor::regular::PLAY };
+                    let icon = if self.animation.playing { egui_phosphor::regular::PAUSE } else { egui_phosphor::regular::PLAY };
                     if ui.add_sized(btn_size, egui::Button::new(egui::RichText::new(icon).size(18.0))).clicked() {
-                        if !self.anim.playing {
+                        if !self.animation.playing {
                             // If at end of a non-looping anim, restart
-                            if !self.anim.looping && duration > 0.0 && self.anim.time >= duration - 1e-6 {
-                                self.anim.time = 0.0;
+                            if !self.animation.looping && duration > 0.0 && self.animation.time >= duration - 1e-6 {
+                                self.animation.time = 0.0;
                             }
-                            self.anim.playing = true;
+                            self.animation.playing = true;
                         } else {
-                            self.anim.playing = false;
+                            self.animation.playing = false;
                         }
                     }
                     // Stop / rewind
                     if ui.add_sized(btn_size, egui::Button::new(egui::RichText::new(egui_phosphor::regular::STOP).size(18.0))).clicked() {
-                        self.anim.playing = false;
-                        self.anim.time    = 0.0;
+                        self.animation.playing = false;
+                        self.animation.time    = 0.0;
                     }
                     // Step forward one frame
                     if ui.add_sized(btn_size, egui::Button::new(egui::RichText::new(egui_phosphor::regular::SKIP_FORWARD).size(18.0)))
                         .on_hover_text("Step forward one frame")
                         .clicked()
                     {
-                        self.anim.playing = false;
-                        self.anim.step_forward(duration);
+                        self.animation.playing = false;
+                        self.animation.step_forward(duration);
                     }
 
                     ui.add_space(6.0);
 
                     // Time scrubber
                     let dur = duration as f32;
-                    let mut t = self.anim.time as f32;
+                    let mut t = self.animation.time as f32;
                     ui.label(format!("t: {:.3} s", t));
                     if ui.add(egui::Slider::new(&mut t, 0.0..=dur.max(0.01))
                         .show_value(false)
                     ).changed() {
-                        self.anim.time = t as f64;
+                        self.animation.time = t as f64;
                     }
 
                     ui.add_space(4.0);
 
                     // Loop
-                    ui.checkbox(&mut self.anim.looping, "Loop");
+                    ui.checkbox(&mut self.animation.looping, "Loop");
 
                     ui.add_space(4.0);
 
                     // Speed
                     ui.label("Speed:");
                     ui.add_sized([48.0, 18.0],
-                        egui::DragValue::new(&mut self.anim.speed)
+                        egui::DragValue::new(&mut self.animation.speed)
                             .range(0.01..=20.0).speed(0.05).suffix("x")
                     );
 
@@ -975,7 +892,7 @@ impl eframe::App for App {
                     // Frame rate
                     ui.label("FPS:");
                     ui.add_sized([48.0, 18.0],
-                        egui::DragValue::new(&mut self.anim.fps)
+                        egui::DragValue::new(&mut self.animation.fps)
                             .range(1.0..=1000.0).speed(1.0)
                     );
 
@@ -988,8 +905,8 @@ impl eframe::App for App {
                         .on_hover_text("Jump to frame of maximum displacement")
                         .clicked()
                     {
-                        self.anim.playing = false;
-                        self.anim.time = self.find_time_of_max_displacement();
+                        self.animation.playing = false;
+                        self.animation.time = self.find_time_of_max_displacement();
                     }
                     ui.radio_value(&mut self.max_disp_mode, MaxDispMode::Local,   "Local");
                     ui.radio_value(&mut self.max_disp_mode, MaxDispMode::Average, "Avg");
@@ -1001,11 +918,11 @@ impl eframe::App for App {
                     ui.label("Disp scale:");
                     ui.checkbox(&mut self.auto_scale, "Auto");
                     if self.auto_scale {
-                        self.disp_scale = self.compute_auto_scale();
-                        ui.label(format!("{:.4}", self.disp_scale));
+                        self.displacement_scale = self.compute_auto_scale();
+                        ui.label(format!("{:.4}", self.displacement_scale));
                     } else {
                         ui.add(
-                            egui::DragValue::new(&mut self.disp_scale)
+                            egui::DragValue::new(&mut self.displacement_scale)
                                 .range(0.0..=1e9).speed(0.01)
                         );
                     }
@@ -1017,22 +934,22 @@ impl eframe::App for App {
                     // Vis mode
                     ui.label("Vis:");
                     egui::ComboBox::from_id_salt("vis_mode")
-                        .selected_text(match &self.vis_mode {
-                            VisMode::None           => "None",
-                            VisMode::ContourColor   => "Contour",
-                            VisMode::SizeScale      => "Size",
-                            VisMode::ContourAndSize => "Both",
+                        .selected_text(match &self.visualization_mode {
+                            VisualizationMode::None           => "None",
+                            VisualizationMode::ContourColor   => "Contour",
+                            VisualizationMode::SizeScale      => "Size",
+                            VisualizationMode::ContourAndSize => "Both",
                         })
                         .width(72.0)
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.vis_mode, VisMode::None,           "None");
-                            ui.selectable_value(&mut self.vis_mode, VisMode::ContourColor,   "Contour");
-                            ui.selectable_value(&mut self.vis_mode, VisMode::SizeScale,      "Size");
-                            ui.selectable_value(&mut self.vis_mode, VisMode::ContourAndSize, "Both");
+                            ui.selectable_value(&mut self.visualization_mode, VisualizationMode::None,           "None");
+                            ui.selectable_value(&mut self.visualization_mode, VisualizationMode::ContourColor,   "Contour");
+                            ui.selectable_value(&mut self.visualization_mode, VisualizationMode::SizeScale,      "Size");
+                            ui.selectable_value(&mut self.visualization_mode, VisualizationMode::ContourAndSize, "Both");
                         });
 
                     // Palette selector (shown when contour active)
-                    if self.vis_mode == VisMode::ContourColor || self.vis_mode == VisMode::ContourAndSize {
+                    if self.visualization_mode == VisualizationMode::ContourColor || self.visualization_mode == VisualizationMode::ContourAndSize {
                         egui::ComboBox::from_id_salt("palette")
                             .selected_text(self.palette.label())
                             .width(72.0)
@@ -1047,7 +964,7 @@ impl eframe::App for App {
                     }
 
                     // Size scale (shown when size vis active)
-                    if self.vis_mode == VisMode::SizeScale || self.vis_mode == VisMode::ContourAndSize {
+                    if self.visualization_mode == VisualizationMode::SizeScale || self.visualization_mode == VisualizationMode::ContourAndSize {
                         ui.label("Size Scale:");
                         ui.add_sized([48.0, 18.0],
                             egui::DragValue::new(&mut self.size_vis_scale)
@@ -1056,7 +973,7 @@ impl eframe::App for App {
                     }
 
                     // Edge contour (only when contour vis active)
-                    if self.vis_mode == VisMode::ContourColor || self.vis_mode == VisMode::ContourAndSize {
+                    if self.visualization_mode == VisualizationMode::ContourColor || self.visualization_mode == VisualizationMode::ContourAndSize {
                         ui.checkbox(&mut self.edge_contour, "Edge Contour");
                     }
 
@@ -1146,8 +1063,8 @@ impl eframe::App for App {
                 });
 
             // ── Compute animated geometry ─────────────────────────────────
-            let t = self.anim.time;
-            let scale = self.disp_scale;
+            let t = self.animation.time;
+            let scale = self.displacement_scale;
 
             // Imported displacement data is always in SI metres.
             // Convert to the model's current distance unit.
@@ -1170,7 +1087,7 @@ impl eframe::App for App {
                     // FFT filtering active?
                     if self.fft_state.active && self.fft_state.filter_mode != FilterMode::None {
                         if self.fft_state.filter_mode == FilterMode::SingleFreq
-                            && self.fft_state.anim_mode == AnimMode::FreqBased
+                            && self.fft_state.anim_mode == AnimationMode::FreqBased
                             && self.fft_state.single_freq > 0.0
                         {
                             return sample_freq_based(
@@ -1192,16 +1109,16 @@ impl eframe::App for App {
                         }
                     }
                     // Normal path
-                    sample_qualified(&self.datasets, qname, t)
+                    sample_by_channel_path(&self.datasets, qname, t)
                 };
 
-                let ddx = sample_ch(row.dx);
-                let ddy = sample_ch(row.dy);
-                let ddz = sample_ch(row.dz);
+                let ddx = sample_ch(row.channel_dx);
+                let ddy = sample_ch(row.channel_dy);
+                let ddz = sample_ch(row.channel_dz);
 
                 // Transform displacement from local CSYS to global coordinates.
                 // local_csys rows are the local X, Y, Z axes in world space.
-                let m = row.local_csys;
+                let m = row.local_coord_sys.matrix;
                 let gx = m[0][0] * ddx + m[1][0] * ddy + m[2][0] * ddz;
                 let gy = m[0][1] * ddx + m[1][1] * ddy + m[2][1] * ddz;
                 let gz = m[0][2] * ddx + m[1][2] * ddy + m[2][2] * ddz;
@@ -1222,8 +1139,8 @@ impl eframe::App for App {
                 if let Some(c) = row.color_override {
                     [c[0], c[1], c[2], 1.0]
                 } else {
-                    match self.vis_mode {
-                        VisMode::ContourColor | VisMode::ContourAndSize
+                    match self.visualization_mode {
+                        VisualizationMode::ContourColor | VisualizationMode::ContourAndSize
                             => self.palette.sample(m / max_mag, self.reverse_pal),
                         _   => {
                             let c = self.global_node_color;
@@ -1234,8 +1151,8 @@ impl eframe::App for App {
             }).collect();
 
             let node_scales: Vec<f32> = magnitudes.iter().map(|&m| {
-                match self.vis_mode {
-                    VisMode::SizeScale | VisMode::ContourAndSize
+                match self.visualization_mode {
+                    VisualizationMode::SizeScale | VisualizationMode::ContourAndSize
                         => 1.0 + (self.size_vis_scale - 1.0) * (m / max_mag),
                     _   => 1.0,
                 }
@@ -1266,7 +1183,7 @@ impl eframe::App for App {
 
             // Precompute world-space sizes needed for per-edge thickness.
             let pre_actual_node_size = self.node_size * self.bounding_diag()
-                * (self.prefs.max_node_size_pct / 100.0);
+                * (self.preferences.max_node_size_pct / 100.0);
             let pre_actual_edge_thickness = self.edge_thickness * pre_actual_node_size;
 
             let mut edge_segments:    Vec<([f32; 3], [f32; 3])> = Vec::new();
@@ -1291,7 +1208,7 @@ impl eframe::App for App {
                 if let Some(c) = edge.color_override {
                     let ec = [c[0], c[1], c[2], 1.0];
                     edge_colors.push((ec, ec));
-                } else if self.edge_contour && self.vis_mode != VisMode::None {
+                } else if self.edge_contour && self.visualization_mode != VisualizationMode::None {
                     let ca = id_to_color.get(edge.from.as_str()).copied().unwrap_or(global_ec);
                     let cb = id_to_color.get(edge.to.as_str()).copied().unwrap_or(global_ec);
                     edge_colors.push((ca, cb));
@@ -1306,16 +1223,16 @@ impl eframe::App for App {
                 .map(|r| r.selected)
                 .collect();
 
-            // Collect local CSYS per node (parallel with node_positions)
-            let node_csys: Vec<[[f32; 3]; 3]> = self.rows.iter()
+            // Collect local coord sys per node (parallel with node_positions)
+            let node_coord_sys: Vec<[[f32; 3]; 3]> = self.rows.iter()
                 .filter(|r| row_position(r).is_some())
-                .map(|r| r.local_csys)
+                .map(|r| r.local_coord_sys.matrix)
                 .collect();
 
-            // Collect per-node CSYS-visible flags
-            let node_csys_visible: Vec<bool> = self.rows.iter()
+            // Collect per-node coord sys visible flags
+            let node_coord_sys_visible: Vec<bool> = self.rows.iter()
                 .filter(|r| row_position(r).is_some())
-                .map(|r| r.show_csys_axes)
+                .map(|r| r.show_coord_sys_axes)
                 .collect();
 
             // ── Details / Select mode toolbar above the viewport ────────────────
@@ -1432,7 +1349,7 @@ impl eframe::App for App {
                 // Compute actual world-space glyph size from normalised fraction
                 // (same formula as node_size so it scales with the model)
                 let actual_glyph_size = g.size * self.bounding_diag()
-                    * (self.prefs.max_node_size_pct / 100.0) * 0.2;
+                    * (self.preferences.max_node_size_pct / 100.0) * 0.2;
                 (pos, g.shape.clone(), [g.color[0], g.color[1], g.color[2], 1.0], actual_glyph_size, g.stretch, g.tube_ratio)
             }).collect();
             let glyph_sel: Vec<bool> = self.glyphs.iter().map(|g| g.selected).collect();
@@ -1557,13 +1474,13 @@ impl eframe::App for App {
 
             // Compute actual world-space node size from normalised fraction
             let actual_node_size = self.node_size * self.bounding_diag()
-                * (self.prefs.max_node_size_pct / 100.0);
+                * (self.preferences.max_node_size_pct / 100.0);
             let actual_edge_thickness = self.edge_thickness * actual_node_size;
 
             // ── Build vector arrows ────────────────────────────────────────
             // Each entry: (world_pos, dir_normalised, color_rgba, world_length)
             let arrows: Vec<([f32; 3], [f32; 3], [f32; 4], f32)> = if self.show_vectors {
-                let t = self.anim.time;
+                let t = self.animation.time;
                 let bbox = self.bounding_diag().max(1e-6);
 
                 // First pass: compute per-node 3D vectors (in SI units) and colours.
@@ -1580,17 +1497,17 @@ impl eframe::App for App {
                             };
                             match self.vector_vis_mode {
                                 VectorVisMode::Velocity =>
-                                    sample_velocity_qualified(&self.datasets, qname, t),
+                                    sample_velocity_by_channel_path(&self.datasets, qname, t),
                                 VectorVisMode::Acceleration =>
-                                    sample_acceleration_qualified(&self.datasets, qname, t),
+                                    sample_acceleration_by_channel_path(&self.datasets, qname, t),
                             }
                         };
-                        let lx = sample(row.dx);
-                        let ly = sample(row.dy);
-                        let lz = sample(row.dz);
+                        let lx = sample(row.channel_dx);
+                        let ly = sample(row.channel_dy);
+                        let lz = sample(row.channel_dz);
 
                         // Transform local vector to world space via the node's CSYS.
-                        let m = row.local_csys;
+                        let m = row.local_coord_sys.matrix;
                         let wx = m[0][0]*lx + m[1][0]*ly + m[2][0]*lz;
                         let wy = m[0][1]*lx + m[1][1]*ly + m[2][1]*lz;
                         let wz = m[0][2]*lx + m[1][2]*ly + m[2][2]*lz;
@@ -1600,7 +1517,7 @@ impl eframe::App for App {
                         let arrow_color = if self.vector_use_contour {
                             *color
                         } else {
-                            let c = self.prefs.arrow_color;
+                            let c = self.preferences.arrow_color;
                             [c[0], c[1], c[2], 1.0]
                         };
                         Some(([pos[0], pos[1], pos[2]], [wx/mag, wy/mag, wz/mag], arrow_color, mag))
@@ -1645,24 +1562,24 @@ impl eframe::App for App {
                 &edge_colors,
                 &node_colors,
                 &node_scales,
-                &node_csys,
-                &node_csys_visible,
+                &node_coord_sys,
+                &node_coord_sys_visible,
                 &selected_nodes,
                 actual_node_size,
-                self.prefs.local_csys_scale_pct / 100.0,
+                self.preferences.local_coord_sys_scale_pct / 100.0,
                 self.interaction_tool == InteractionTool::Select,
                 actual_edge_thickness,
                 &edge_thicknesses,
-                self.prefs.viewport_bg_color,
-                self.prefs.middle_button_orbit,
+                self.preferences.viewport_bg_color,
+                self.preferences.middle_button_orbit,
                 &glyph_data,
                 &glyph_sel,
                 mesh_surfaces,
                 &wireframe_edges,
                 self.current_distance_unit.label(),
                 &self.current_distance_unit,
-                if self.prefs.lighting_enabled { self.prefs.light_brightness } else { 0.0 },
-                self.prefs.lighting_enabled,
+                if self.preferences.lighting_enabled { self.preferences.light_brightness } else { 0.0 },
+                self.preferences.lighting_enabled,
                 &node_labels,
                 &edge_labels,
                 &glyph_labels,
@@ -1677,7 +1594,7 @@ impl eframe::App for App {
                 self.convert_units(&new_unit);
             }
             if let Some(enabled) = vp_resp.lighting_toggled {
-                self.prefs.lighting_enabled = enabled;
+                self.preferences.lighting_enabled = enabled;
             }
 
             // ── Node picking / selection ──────────────────────────────────────
@@ -1879,7 +1796,7 @@ impl eframe::App for App {
                                             || (e.from == to_id && e.to == from_id)
                                         });
                                         if !exists {
-                                            let id = crate::table::next_edge_id(&self.edges);
+                                            let id = crate::table::generate_edge_id(&self.edges);
                                             self.edges.push(crate::table::Edge {
                                                 id,
                                                 from: from_id,
@@ -1934,15 +1851,15 @@ impl eframe::App for App {
                                 ui.end_row();
 
                                 ui.label("X:");
-                                ui.add(egui::TextEdit::singleline(&mut row.x).desired_width(80.0));
+                                ui.add(egui::TextEdit::singleline(&mut row.x_str).desired_width(80.0));
                                 ui.end_row();
 
                                 ui.label("Y:");
-                                ui.add(egui::TextEdit::singleline(&mut row.y).desired_width(80.0));
+                                ui.add(egui::TextEdit::singleline(&mut row.y_str).desired_width(80.0));
                                 ui.end_row();
 
                                 ui.label("Z:");
-                                ui.add(egui::TextEdit::singleline(&mut row.z).desired_width(80.0));
+                                ui.add(egui::TextEdit::singleline(&mut row.z_str).desired_width(80.0));
                                 ui.end_row();
 
                                 // Channel mappings
@@ -1953,9 +1870,9 @@ impl eframe::App for App {
                                 };
 
                                 for (label, ch) in [
-                                    ("DX:", &mut row.dx),
-                                    ("DY:", &mut row.dy),
-                                    ("DZ:", &mut row.dz),
+                                    ("DX:", &mut row.channel_dx),
+                                    ("DY:", &mut row.channel_dy),
+                                    ("DZ:", &mut row.channel_dz),
                                 ] {
                                     ui.label(label);
                                     egui::ComboBox::from_id_salt(format!("ch_{}", label))
@@ -1996,13 +1913,13 @@ impl eframe::App for App {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.strong("Local CSYS");
-                            ui.checkbox(&mut self.rows[ni].show_csys_axes, "Show axes");
+                            ui.checkbox(&mut self.rows[ni].show_coord_sys_axes, "Show axes");
                             if ui.button("✏  Edit CSYS…").clicked() {
                                 open_csys_for = Some(ni);
                             }
                         });
 
-                        let m = self.rows[ni].local_csys;
+                        let m = self.rows[ni].local_coord_sys.matrix;
                         if m == identity_mat3() {
                             ui.label(
                                 egui::RichText::new("  Identity (aligned with global)")
@@ -2248,53 +2165,53 @@ impl eframe::App for App {
         // Open CSYS builder from the node popup "Edit CSYS…" button
         if let Some(ni) = open_csys_for {
             let row = &self.rows[ni];
-            self.csys_builder.load_with_ops(row.local_csys_base, row.local_csys_ops.clone());
-            self.csys_builder_target = CsysTarget::Node(ni);
-            self.show_csys_builder = true;
+            self.coord_sys_builder.load_with_ops(row.local_coord_sys.base, row.local_coord_sys.ops.clone());
+            self.coord_sys_builder_target = CoordSysTarget::Node(ni);
+            self.show_coord_sys_builder = true;
         }
 
         // Open CSYS builder from Manager "✎" Edit button
-        if let Some((name, base_mat, ops)) = self.csys_mgr_edit.take() {
-            self.csys_builder.load_with_ops(base_mat, ops);
-            self.csys_builder_target = CsysTarget::Manager(name);
-            self.show_csys_builder = true;
+        if let Some((name, base_mat, ops)) = self.coord_sys_manager_edit.take() {
+            self.coord_sys_builder.load_with_ops(base_mat, ops);
+            self.coord_sys_builder_target = CoordSysTarget::Manager(name);
+            self.show_coord_sys_builder = true;
         }
 
         // Apply CSYS result if the builder produced one (single-node apply or manager edit)
-        if let Some((mat, base_mat, ops)) = self.csys_apply_result.take() {
-            match &self.csys_builder_target {
-                CsysTarget::Node(ni) => {
+        if let Some((mat, base_mat, ops)) = self.coord_sys_apply_result.take() {
+            match &self.coord_sys_builder_target {
+                CoordSysTarget::Node(ni) => {
                     if *ni < self.rows.len() {
-                        self.rows[*ni].local_csys = mat;
-                        self.rows[*ni].local_csys_base = base_mat;
-                        self.rows[*ni].local_csys_ops = ops;
+                        self.rows[*ni].local_coord_sys.matrix = mat;
+                        self.rows[*ni].local_coord_sys.base = base_mat;
+                        self.rows[*ni].local_coord_sys.ops = ops;
                     }
                 }
-                CsysTarget::Manager(name) => {
-                    self.csys_manager.add_or_replace(name.clone(), mat, base_mat, ops);
+                CoordSysTarget::Manager(name) => {
+                    self.coord_sys_manager.add_or_replace(name.clone(), mat, base_mat, ops);
                 }
-                CsysTarget::None => {}
+                CoordSysTarget::None => {}
             }
         }
 
         // Save-to-Manager result from the builder
-        if let Some((name, mat, base_mat, ops)) = self.csys_save_mgr_result.take() {
-            self.csys_manager.add_or_replace(name, mat, base_mat, ops);
+        if let Some((name, mat, base_mat, ops)) = self.coord_sys_save_mgr_result.take() {
+            self.coord_sys_manager.add_or_replace(name, mat, base_mat, ops);
         }
 
         // Apply from manager to all selected nodes
-        if let Some((mat, base_mat, ops)) = self.csys_mgr_apply.take() {
+        if let Some((mat, base_mat, ops)) = self.coord_sys_manager_apply.take() {
             for r in &mut self.rows {
                 if r.selected {
-                    r.local_csys = mat;
-                    r.local_csys_base = base_mat;
-                    r.local_csys_ops = ops.clone();
+                    r.local_coord_sys.matrix = mat;
+                    r.local_coord_sys.base = base_mat;
+                    r.local_coord_sys.ops = ops.clone();
                 }
             }
         }
 
         // ── Floating windows ──────────────────────────────────────────────
-        show_options_window(ctx, &mut self.show_options, &mut self.prefs);
+        show_options_window(ctx, &mut self.show_options, &mut self.preferences);
         show_views_window(ctx, &mut self.show_views, &mut self.saved_views, &mut self.viewport);
         show_time_plot_window(
             ctx,
@@ -2303,21 +2220,21 @@ impl eframe::App for App {
             &self.datasets,
             &self.channel_names,
             &self.rows,
-            self.anim.time,
+            self.animation.time,
         );
 
-        let target_label = match &self.csys_builder_target {
-            CsysTarget::Node(ni) => self.rows.get(*ni).map(|r| r.id.as_str()),
-            CsysTarget::Manager(name) => Some(name.as_str()),
-            CsysTarget::None => None,
+        let target_label = match &self.coord_sys_builder_target {
+            CoordSysTarget::Node(ni) => self.rows.get(*ni).map(|r| r.id.as_str()),
+            CoordSysTarget::Manager(name) => Some(name.as_str()),
+            CoordSysTarget::None => None,
         };
-        show_csys_builder_window(
+        show_coord_sys_builder_window(
             ctx,
-            &mut self.show_csys_builder,
-            &mut self.csys_builder,
+            &mut self.show_coord_sys_builder,
+            &mut self.coord_sys_builder,
             target_label,
-            &mut self.csys_apply_result,
-            &mut self.csys_save_mgr_result,
+            &mut self.coord_sys_apply_result,
+            &mut self.coord_sys_save_mgr_result,
         );
 
         // ── Create Nodes dialog ───────────────────────────────────────────
@@ -2326,7 +2243,7 @@ impl eframe::App for App {
             &mut self.show_create_nodes,
             &mut self.create_nodes,
             &self.rows,
-            &self.csys_manager,
+            &self.coord_sys_manager,
             &self.current_distance_unit,
         ) {
             self.rows.extend(new_rows);
@@ -2343,18 +2260,18 @@ impl eframe::App for App {
         match export_action {
             ExportAction::StartCapture { total_frames } => {
                 // Save current animation state
-                self.export_video.saved_time = self.anim.time;
-                self.export_video.saved_playing = self.anim.playing;
-                self.anim.playing = false;
-                self.anim.time = 0.0;
+                self.export_video.saved_time = self.animation.time;
+                self.export_video.saved_playing = self.animation.playing;
+                self.animation.playing = false;
+                self.animation.time = 0.0;
                 self.export_video.phase = ExportPhase::Capturing {
                     frame: 0, total: total_frames, waiting: false,
                 };
                 ctx.request_repaint();
             }
             ExportAction::Cancel => {
-                self.anim.time = self.export_video.saved_time;
-                self.anim.playing = self.export_video.saved_playing;
+                self.animation.time = self.export_video.saved_time;
+                self.animation.playing = self.export_video.saved_playing;
                 self.export_video.phase = ExportPhase::Idle;
             }
             ExportAction::None => {}
@@ -2365,7 +2282,7 @@ impl eframe::App for App {
             ExportPhase::Capturing { frame, total, waiting: false } => {
                 // Set animation time for this frame and request screenshot
                 let fps = self.export_video.fps.max(1.0) as f64;
-                self.anim.time = *frame as f64 / fps;
+                self.animation.time = *frame as f64 / fps;
                 // We need one render pass with the correct time before capturing.
                 // Request screenshot — result arrives next frame.
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -2377,8 +2294,8 @@ impl eframe::App for App {
             ExportPhase::Encoding => {
                 run_ffmpeg_encode(&mut self.export_video);
                 // Restore animation state
-                self.anim.time = self.export_video.saved_time;
-                self.anim.playing = self.export_video.saved_playing;
+                self.animation.time = self.export_video.saved_time;
+                self.animation.playing = self.export_video.saved_playing;
             }
             _ => {}
         }
@@ -2392,8 +2309,8 @@ impl eframe::App for App {
                     got_screenshot = true;
                     if done && self.export_video.phase != ExportPhase::Encoding {
                         // Restore animation state (PNG sequence done)
-                        self.anim.time = self.export_video.saved_time;
-                        self.anim.playing = self.export_video.saved_playing;
+                        self.animation.time = self.export_video.saved_time;
+                        self.animation.playing = self.export_video.saved_playing;
                     }
                 }
             }

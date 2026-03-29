@@ -50,6 +50,10 @@ pub enum Unit {
     FootPerSec2,
 }
 
+impl Default for Unit {
+    fn default() -> Self { Self::Millimeter }
+}
+
 impl Unit {
     /// Human-readable label shown in the dropdown.
     pub fn label(&self) -> &'static str {
@@ -106,6 +110,32 @@ impl Unit {
             DataType::Velocity      => Unit::MeterPerSec,
             DataType::Acceleration  => Unit::MeterPerSec2,
         }
+    }
+
+    /// All distance unit variants (in display order), for use where only
+    /// distance units are appropriate (e.g. model coordinate unit selector).
+    pub const DISTANCE_UNITS: &'static [Unit] = &[
+        Unit::Millimeter, Unit::Meter, Unit::Kilometer,
+        Unit::Inch, Unit::Foot, Unit::Mile,
+    ];
+
+    /// Meters per one of this unit — used when converting model coordinates.
+    /// Only valid for distance variants; panics on velocity/acceleration variants.
+    pub fn to_meters(&self) -> f64 {
+        match self {
+            Unit::Millimeter => 0.001,
+            Unit::Meter      => 1.0,
+            Unit::Kilometer  => 1000.0,
+            Unit::Inch       => 0.0254,
+            Unit::Foot       => 0.3048,
+            Unit::Mile       => 1609.344,
+            _ => panic!("to_meters() called on non-distance Unit variant"),
+        }
+    }
+
+    /// Conversion factor: multiply by this to convert from `self` to `to`.
+    pub fn convert_factor(&self, to: &Unit) -> f64 {
+        self.to_meters() / to.to_meters()
     }
 
     /// All valid units for a given DataType (in display order).
@@ -542,19 +572,19 @@ pub fn channel_max_displacement(datasets: &[Dataset], qualified: &str) -> f32 {
 }
 
 /// Sample displacement for a qualified channel name at time `t`.
-pub fn sample_qualified(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
+pub fn sample_by_channel_path(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
     let Some((file, ch)) = qualified.split_once("::") else { return 0.0 };
     let Some(ds) = datasets.iter().find(|d| d.name == file) else { return 0.0 };
     ds.sample_displacement(ch, t)
 }
 
-pub fn sample_velocity_qualified(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
+pub fn sample_velocity_by_channel_path(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
     let Some((file, ch)) = qualified.split_once("::") else { return 0.0 };
     let Some(ds) = datasets.iter().find(|d| d.name == file) else { return 0.0 };
     ds.sample_velocity_at(ch, t)
 }
 
-pub fn sample_acceleration_qualified(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
+pub fn sample_acceleration_by_channel_path(datasets: &[Dataset], qualified: &str, t: f64) -> f32 {
     let Some((file, ch)) = qualified.split_once("::") else { return 0.0 };
     let Some(ds) = datasets.iter().find(|d| d.name == file) else { return 0.0 };
     ds.sample_acceleration_at(ch, t)
@@ -570,7 +600,7 @@ pub fn max_duration(
     // Collect the set of dataset names referenced by at least one node.
     let mut used_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for row in rows {
-        for idx in [row.dx, row.dy, row.dz] {
+        for idx in [row.channel_dx, row.channel_dy, row.channel_dz] {
             if idx == 0 { continue; }
             if let Some(qname) = channel_names.get(idx - 1) {
                 if let Some((file, _)) = qname.split_once("::") {

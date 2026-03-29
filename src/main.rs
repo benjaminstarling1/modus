@@ -1,11 +1,18 @@
 mod app;
+mod app_ui;
 mod create_nodes;
-mod csys_builder;
+mod coord_sys_builder;
+mod csv_io;
+mod entities;
 mod export_video;
 mod data;
 mod fft;
+mod mesh_gen;
+mod palette;
 mod persist;
+mod renderer;
 mod table;
+mod table_ui;
 mod time_plot;
 mod viewport;
 

@@ -323,7 +323,7 @@ pub fn show_time_plot_window(
                         state.selected_channels.clear();
                         for row in rows {
                             if !row.selected { continue; }
-                            for idx in [row.dx, row.dy, row.dz, row.rx, row.ry, row.rz] {
+                            for idx in [row.channel_dx, row.channel_dy, row.channel_dz, row.channel_rx, row.channel_ry, row.channel_rz] {
                                 if idx > 0 && idx <= channel_names.len()
                                     && !state.selected_channels.contains(&(idx - 1))
                                 {

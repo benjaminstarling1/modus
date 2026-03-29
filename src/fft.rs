@@ -124,7 +124,7 @@ pub fn apply_freq_filter(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AnimMode {
+pub enum AnimationMode {
     /// Use filtered time-domain data (shows decay, transients)
     TimeBased,
     /// Synthesise steady-state sine wave from FFT amplitude+phase (no decay)
@@ -176,7 +176,7 @@ pub struct FftPaneState {
     pub selected_channel: usize,  // 0 = none, 1..N = index into channel_names
     pub show_phase:       bool,
     pub filter_mode:      FilterMode,
-    pub anim_mode:        AnimMode,
+    pub anim_mode:        AnimationMode,
     pub freq_lo:          f32,    // lower bound of selection (Hz)
     pub freq_hi:          f32,    // upper bound of selection (Hz)
     pub single_freq:      f32,    // single clicked freq (Hz), 0 = none
@@ -192,7 +192,7 @@ impl Default for FftPaneState {
             selected_channel: 0,
             show_phase:       false,
             filter_mode:      FilterMode::None,
-            anim_mode:        AnimMode::TimeBased,
+            anim_mode:        AnimationMode::TimeBased,
             freq_lo:          0.0,
             freq_hi:          0.0,
             single_freq:      0.0,
@@ -483,8 +483,8 @@ pub fn show_fft_panel(
     if state.filter_mode == FilterMode::SingleFreq && state.single_freq > 0.0 {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Animate:").size(11.0));
-            ui.selectable_value(&mut state.anim_mode, AnimMode::FreqBased, "Frequency");
-            ui.selectable_value(&mut state.anim_mode, AnimMode::TimeBased, "Time");
+            ui.selectable_value(&mut state.anim_mode, AnimationMode::FreqBased, "Frequency");
+            ui.selectable_value(&mut state.anim_mode, AnimationMode::TimeBased, "Time");
         });
     }
 
@@ -497,9 +497,9 @@ pub fn show_fft_panel(
         if ui.add_enabled(can_apply, egui::Button::new(format!("{}  Apply", egui_phosphor::regular::CHECK))).clicked() {
             state.active = true;
             // For time-based: pre-compute filtered displacements for all channels
-            if state.anim_mode == AnimMode::TimeBased || state.filter_mode != FilterMode::SingleFreq {
+            if state.anim_mode == AnimationMode::TimeBased || state.filter_mode != FilterMode::SingleFreq {
                 state.filtered_displacements.clear();
-                let (flo, fhi) = resolve_freq_bounds(state);
+                let (flo, fhi) = compute_freq_bounds(state);
                 for qname in channel_names {
                     if let Some((file, ch)) = qname.split_once("::") {
                         if let Some(ds) = datasets.iter().find(|d| d.name == file) {
@@ -549,7 +549,7 @@ pub fn show_fft_panel(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn resolve_freq_bounds(state: &FftPaneState) -> (f32, f32) {
+fn compute_freq_bounds(state: &FftPaneState) -> (f32, f32) {
     match state.filter_mode {
         FilterMode::SingleFreq => {
             // Narrow band around the single frequency (±2% of freq or ±0.5 Hz min)

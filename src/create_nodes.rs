@@ -1,5 +1,5 @@
-use crate::csys_builder::CsysManager;
-use crate::persist::DistanceUnit;
+use crate::coord_sys_builder::CoordSysManager;
+use crate::data::Unit;
 use crate::table::{Row, identity_mat3, row_position};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ pub struct CreateNodesState {
     pub mode: CreateNodesMode,
     // Copy-with-offset
     pub offset: [f32; 3],
-    pub offset_unit: DistanceUnit,
+    pub offset_unit: Unit,
     pub csys_index: usize,
     // Interpolate
     pub node_a: String,
@@ -40,7 +40,7 @@ impl Default for CreateNodesState {
         Self {
             mode: CreateNodesMode::None,
             offset: [0.0; 3],
-            offset_unit: DistanceUnit::default(),
+            offset_unit: Unit::default(),
             csys_index: 0,
             node_a: String::new(),
             node_b: String::new(),
@@ -61,8 +61,8 @@ pub fn show_create_nodes_window(
     open:       &mut bool,
     state:      &mut CreateNodesState,
     rows:       &[Row],
-    manager:    &CsysManager,
-    model_unit: &DistanceUnit,
+    manager:    &CoordSysManager,
+    model_unit: &Unit,
 ) -> Option<Vec<Row>> {
     if !*open { return None; }
 
@@ -129,8 +129,8 @@ fn copy_with_offset_ui(
     ui:         &mut egui::Ui,
     state:      &mut CreateNodesState,
     rows:       &[Row],
-    manager:    &CsysManager,
-    model_unit: &DistanceUnit,
+    manager:    &CoordSysManager,
+    model_unit: &Unit,
 ) -> Option<Vec<Row>> {
     let selected: Vec<&Row> = rows.iter().filter(|r| r.selected).collect();
     let sel_count = selected.len();
@@ -169,7 +169,7 @@ fn copy_with_offset_ui(
             .selected_text(state.offset_unit.label())
             .width(52.0)
             .show_ui(ui, |ui| {
-                for u in DistanceUnit::ALL {
+                for u in Unit::DISTANCE_UNITS {
                     ui.selectable_value(&mut state.offset_unit, u.clone(), u.label());
                 }
             });
@@ -231,22 +231,20 @@ fn copy_with_offset_ui(
             if let Some([x, y, z]) = row_position(src) {
                 let mut nr = Row {
                     id: format!("{}_copy", src.id),
-                    x: format!("{}", x + global_offset[0]),
-                    y: format!("{}", y + global_offset[1]),
-                    z: format!("{}", z + global_offset[2]),
-                    dx: src.dx,
-                    dy: src.dy,
-                    dz: src.dz,
-                    rx: src.rx,
-                    ry: src.ry,
-                    rz: src.rz,
+                    x_str: format!("{}", x + global_offset[0]),
+                    y_str: format!("{}", y + global_offset[1]),
+                    z_str: format!("{}", z + global_offset[2]),
+                    channel_dx: src.channel_dx,
+                    channel_dy: src.channel_dy,
+                    channel_dz: src.channel_dz,
+                    channel_rx: src.channel_rx,
+                    channel_ry: src.channel_ry,
+                    channel_rz: src.channel_rz,
                     selected: false,
                     color_override: src.color_override,
                     stored_color: src.stored_color,
-                    local_csys: src.local_csys,
-                    local_csys_base: src.local_csys_base,
-                    local_csys_ops: src.local_csys_ops.clone(),
-                    show_csys_axes: src.show_csys_axes,
+                    local_coord_sys: src.local_coord_sys.clone(),
+                    show_coord_sys_axes: src.show_coord_sys_axes,
                 };
                 // Ensure unique ID if original is empty
                 if src.id.is_empty() {
@@ -364,9 +362,9 @@ fn interpolate_ui(
             let t = i as f32 / (n + 1) as f32;
             new_rows.push(Row {
                 id: format!("{}_{}_i{}", state.node_a, state.node_b, i),
-                x: format!("{}", ax + (bx - ax) * t),
-                y: format!("{}", ay + (by - ay) * t),
-                z: format!("{}", az + (bz - az) * t),
+                x_str: format!("{}", ax + (bx - ax) * t),
+                y_str: format!("{}", ay + (by - ay) * t),
+                z_str: format!("{}", az + (bz - az) * t),
                 ..Row::default()
             });
         }
